@@ -33,3 +33,7 @@ go.work.sum
 
 # Build output
 bin/
+
+# gshift runtime and manual test artifacts
+/received/
+/testdata/*.bin

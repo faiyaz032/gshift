@@ -1,3 +1,4 @@
+// Package protocol defines the gshift wire format.
 package protocol
 
 import (
@@ -11,33 +12,54 @@ import (
 )
 
 const (
-	Magic           uint32 = 0x47534846
-	Version         uint8  = 1
-	FixedHeaderSize        = 4 + 1 + 2 + 8
-	MaxNameLen             = 1024
-	MaxFileSize            = 1 << 40
+	// Magic is the first four bytes of every gshift stream: ASCII "GSHF".
+	Magic uint32 = 0x47534846
+
+	// Version is the wire format version this build speaks.
+	Version uint8 = 1
+
+	// FixedHeaderSize is the header size up to, but not including, the name.
+	FixedHeaderSize = 4 + 1 + 2 + 8
+
+	// MaxNameLen is the largest file name, in bytes, that a header may carry.
+	MaxNameLen = 1024
+
+	// MaxFileSize is the largest payload, in bytes, that a header may declare.
+	MaxFileSize = 1 << 40
 )
 
 var (
-	ErrBadMagic     = errors.New("protocol: not a gshift stream")
-	ErrBadVersion   = errors.New("protocol: unsupported version")
-	ErrBadName      = errors.New("protocol: invalid file name")
+	// ErrBadMagic reports a stream that does not begin with Magic.
+	ErrBadMagic = errors.New("protocol: not a gshift stream")
+
+	// ErrBadVersion reports a wire format version this build does not speak.
+	ErrBadVersion = errors.New("protocol: unsupported version")
+
+	// ErrBadName reports a file name that is empty, too long, not valid UTF-8,
+	// or unusable as a single path element.
+	ErrBadName = errors.New("protocol: invalid file name")
+
+	// ErrSizeTooLarge reports a payload length outside 0..MaxFileSize.
 	ErrSizeTooLarge = errors.New("protocol: declared size exceeds limit")
 )
 
+// Header describes a single file transfer.
 type Header struct {
+	// Name is the file name, with no directory components.
 	Name string
+
+	// Size is the payload length in bytes.
 	Size int64
 }
 
+// WriteHeader encodes h onto w in a single Write. It reports ErrBadName or
+// ErrSizeTooLarge, without writing anything, for a header it cannot encode.
 func WriteHeader(w io.Writer, h Header) error {
 	name := []byte(h.Name)
 	nameLen := len(name)
 	if nameLen == 0 || nameLen > MaxNameLen {
 		return fmt.Errorf("%w: length %d", ErrBadName, nameLen)
 	}
-	// NAME is UTF-8 on the wire and ReadHeader enforces that, so refuse here
-	// too rather than emit a header no compliant peer would accept.
 	if !utf8.Valid(name) {
 		return fmt.Errorf("%w: not valid UTF-8", ErrBadName)
 	}
@@ -60,9 +82,10 @@ func WriteHeader(w io.Writer, h Header) error {
 	return nil
 }
 
+// ReadHeader decodes one header from r, consuming exactly its bytes and leaving
+// the payload in the stream. It validates every field before returning, and
+// reports the zero Header alongside any error.
 func ReadHeader(r io.Reader) (Header, error) {
-	// A fixed size array rather than a slice, so it stays on the stack and
-	// costs no allocation.
 	var fixed [FixedHeaderSize]byte
 
 	if _, err := io.ReadFull(r, fixed[:]); err != nil {
@@ -100,14 +123,15 @@ func ReadHeader(r io.Reader) (Header, error) {
 	return Header{Name: string(name), Size: int64(size)}, nil
 }
 
+// SafeName reduces a peer-supplied name to a single path element that cannot
+// escape the destination directory. It reports ErrBadName for a name that
+// reduces to nothing usable, or that contains a NUL byte.
 func SafeName(name string) (string, error) {
-	// filepath.Base strips every directory component: "a/b/c.txt" -> "c.txt".
 	base := filepath.Base(name)
 	switch {
 	case base == "." || base == ".." || base == string(filepath.Separator):
 		return "", fmt.Errorf("%w: %q", ErrBadName, name)
 	case strings.ContainsRune(base, 0):
-		// A NUL byte can truncate the name inside C-based syscalls.
 		return "", fmt.Errorf("%w: contains NUL", ErrBadName)
 	}
 	return base, nil
