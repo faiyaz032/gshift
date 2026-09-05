@@ -17,11 +17,14 @@ const usage = `gshift - fast file transfer
 
 usage:
   gshift serve [-addr <address>] [-out <dir>]
-  gshift send <file> <host:port>
+  gshift send [-parallel <n>] <file> <host:port>
 
 serve flags:
-  -addr   address to listen on            (default ":9000")
-  -out    directory to write files into   (default "./received")
+  -addr       address to listen on            (default ":9000")
+  -out        directory to write files into   (default "./received")
+
+send flags:
+  -parallel   connections to split the file across   (default 4)
 `
 
 const (
@@ -29,6 +32,8 @@ const (
 	exitFailure = 1
 	exitUsage   = 2
 )
+
+const defaultParallel = 4
 
 var (
 	errUsage = errors.New("usage")
@@ -73,11 +78,11 @@ func execute(cmd string, args []string) error {
 		return srv.ListenAndServe()
 
 	case "send":
-		src, addr, err := parseSend(args)
+		src, addr, parallel, err := parseSend(args)
 		if err != nil {
 			return err
 		}
-		return client.Send(addr, src)
+		return client.Send(addr, src, parallel)
 
 	case "":
 		return fmt.Errorf("%w: no command given", errUsage)
@@ -107,19 +112,21 @@ func parseServe(args []string) (*server.Server, error) {
 	return &server.Server{Addr: *addr, OutDir: *out}, nil
 }
 
-func parseSend(args []string) (src, addr string, err error) {
+func parseSend(args []string) (src, addr string, parallel int, err error) {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
+	p := fs.Int("parallel", defaultParallel, "connections to split the file across")
+
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return "", "", errHelp
+			return "", "", 0, errHelp
 		}
-		return "", "", fmt.Errorf("%w: send: %w", errUsage, err)
+		return "", "", 0, fmt.Errorf("%w: send: %w", errUsage, err)
 	}
 	if fs.NArg() != 2 {
-		return "", "", fmt.Errorf("%w: send wants <file> <host:port>, got %d arguments", errUsage, fs.NArg())
+		return "", "", 0, fmt.Errorf("%w: send wants <file> <host:port>, got %d arguments", errUsage, fs.NArg())
 	}
 
-	return fs.Arg(0), fs.Arg(1), nil
+	return fs.Arg(0), fs.Arg(1), *p, nil
 }

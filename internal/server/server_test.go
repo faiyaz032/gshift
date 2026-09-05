@@ -35,8 +35,9 @@ func TestMain(m *testing.M) {
 // 1. helpers
 // ---------------------------------------------------------------------------
 
-// wire builds the bytes a sender puts on the connection. size goes into the
-// header as given, so it can differ from len(payload) on purpose.
+// wire builds the bytes a sender puts on the connection for a file sent whole,
+// in a single chunk. size goes into the header as given, so it can differ
+// from len(payload) on purpose.
 func wire(t *testing.T, name string, size int64, payload []byte) []byte {
 	t.Helper()
 
@@ -49,12 +50,49 @@ func wire(t *testing.T, name string, size int64, payload []byte) []byte {
 
 // encode is wire without a *testing.T, for callers that must not call FailNow.
 func encode(name string, size int64, payload []byte) ([]byte, error) {
+	return chunk(name, size, 0, size, payload)
+}
+
+// chunk builds the bytes for one chunk of a (possibly multi connection)
+// transfer: name and total are the same on every chunk of one file, offset
+// and length describe the slice this chunk carries.
+func chunk(name string, total, offset, length int64, payload []byte) ([]byte, error) {
 	var b bytes.Buffer
-	if err := protocol.WriteHeader(&b, protocol.Header{Name: name, Size: size}); err != nil {
+	if err := protocol.WriteHeader(&b, protocol.Header{Name: name, TotalSize: total, Offset: offset, Length: length}); err != nil {
 		return nil, err
 	}
 	b.Write(payload)
 	return b.Bytes(), nil
+}
+
+// chunkWire is chunk, failing the test instead of returning an error.
+func chunkWire(t *testing.T, name string, total, offset, length int64, payload []byte) []byte {
+	t.Helper()
+
+	b, err := chunk(name, total, offset, length, payload)
+	if err != nil {
+		t.Fatalf("WriteHeader(%q, total=%d, offset=%d, length=%d) error = %v, want nil", name, total, offset, length, err)
+	}
+	return b
+}
+
+// deliverChunks runs receive concurrently, once per entry in wires, against
+// the same server, and returns every call's error in the same order. Use it
+// to drive several connections that carry chunks of the same file.
+func deliverChunks(t *testing.T, s *Server, wires [][]byte) []error {
+	t.Helper()
+
+	errs := make([]error, len(wires))
+	var wg sync.WaitGroup
+	for i, w := range wires {
+		wg.Add(1)
+		go func(i int, w []byte) {
+			defer wg.Done()
+			errs[i] = deliver(t, s, w)
+		}(i, w)
+	}
+	wg.Wait()
+	return errs
 }
 
 // deliver runs one receive over an in memory connection and returns its error.
@@ -429,6 +467,247 @@ func TestReceive_FailsWhenTheOutputDirDoesNotExist(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "create") {
 		t.Errorf("receive() error = %q, want it to mention the create step", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2b. chunked transfers: several connections carrying one file
+// ---------------------------------------------------------------------------
+
+func TestReceive_CommitsOnlyOnceEveryChunkHasArrived(t *testing.T) {
+	s := newServer(t)
+	const total = 10
+
+	first := chunkWire(t, "split.bin", total, 0, 4, []byte("ABCD"))
+	second := chunkWire(t, "split.bin", total, 4, 6, []byte("EFGHIJ"))
+
+	for i, err := range deliverChunks(t, s, [][]byte{first, second}) {
+		if err != nil {
+			t.Fatalf("chunk %d: receive() error = %v, want nil", i, err)
+		}
+	}
+
+	wantFile(t, s.OutDir, "split.bin", "ABCDEFGHIJ")
+	wantOnly(t, s.OutDir, "split.bin")
+}
+
+func TestReceive_HandlesManyConcurrentChunksOfTheSameFileWithoutCorruption(t *testing.T) {
+	// each chunk writes to a different slice of the same shared file
+	// concurrently. run this under -race.
+	s := newServer(t)
+
+	const chunkSize = 4096
+	const numChunks = 8
+
+	var want bytes.Buffer
+	wires := make([][]byte, numChunks)
+	for i := range numChunks {
+		part := bytes.Repeat([]byte{byte('A' + i)}, chunkSize)
+		want.Write(part)
+		wires[i] = chunkWire(t, "big.bin", chunkSize*numChunks, int64(i*chunkSize), chunkSize, part)
+	}
+
+	for i, err := range deliverChunks(t, s, wires) {
+		if err != nil {
+			t.Fatalf("chunk %d: receive() error = %v, want nil", i, err)
+		}
+	}
+
+	wantFile(t, s.OutDir, "big.bin", want.String())
+	wantOnly(t, s.OutDir, "big.bin")
+}
+
+func TestReceive_OneFailingChunkAbortsTheWholeFileEvenIfOthersSucceeded(t *testing.T) {
+	// "bad" always independently reports io.ErrUnexpectedEOF, since it is the
+	// one violating its own declared length; "good" may additionally report
+	// an error too, if it happens to run after "bad" has already poisoned the
+	// name (see TestReceive_RejectsAChunkForANameWhoseEarlierTransferFailed).
+	// Either way, nothing is ever left on disk.
+	s := newServer(t)
+	const total = 10
+
+	good := chunkWire(t, "abort.bin", total, 0, 4, []byte("ABCD"))
+	// promises 6 bytes at offset 4, but only 2 are ever put on the wire
+	bad := chunkWire(t, "abort.bin", total, 4, 6, []byte("EF"))
+
+	errs := deliverChunks(t, s, [][]byte{good, bad})
+
+	sawTruncation := false
+	for _, err := range errs {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			sawTruncation = true
+		}
+	}
+	if !sawTruncation {
+		t.Fatal("want the truncated chunk to be reported with io.ErrUnexpectedEOF")
+	}
+
+	if got := entries(t, s.OutDir); len(got) != 0 {
+		t.Errorf("output dir holds %v, want it empty: no partial file under any name, even though the other chunk may have finished", got)
+	}
+}
+
+func TestReceive_RejectsAChunkForANameWhoseEarlierTransferFailed(t *testing.T) {
+	// once a transfer under a name has failed, the name stays rejected rather
+	// than silently letting a late chunk start a fresh, doomed transfer under
+	// the same temp file (which would otherwise leak a .gshift-part forever).
+	s := newServer(t)
+	const total = 10
+
+	bad := chunkWire(t, "poisoned.bin", total, 0, 6, []byte("AB"))
+	if err := deliver(t, s, bad); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("receive() error = %v, want it to wrap %v", err, io.ErrUnexpectedEOF)
+	}
+
+	late := chunkWire(t, "poisoned.bin", total, 6, 4, []byte("CDEF"))
+	if err := deliver(t, s, late); err == nil {
+		t.Fatal("receive() error = nil, want the poisoned name to be rejected")
+	}
+
+	if got := entries(t, s.OutDir); len(got) != 0 {
+		t.Errorf("output dir holds %v, want it empty", got)
+	}
+}
+
+func TestReceive_ASuccessfulTransferDoesNotPoisonTheNameForLaterUse(t *testing.T) {
+	s := newServer(t)
+
+	if err := deliver(t, s, wire(t, "reuse.txt", 5, []byte("first"))); err != nil {
+		t.Fatalf("first receive() error = %v, want nil", err)
+	}
+	wantFile(t, s.OutDir, "reuse.txt", "first")
+
+	if err := deliver(t, s, wire(t, "reuse.txt", 6, []byte("second"))); err != nil {
+		t.Fatalf("second receive() error = %v, want nil", err)
+	}
+	wantFile(t, s.OutDir, "reuse.txt", "second")
+}
+
+func TestReceive_RejectsChunksThatOverlapAndAbortsTheTransfer(t *testing.T) {
+	// two chunks each covering the same range of the file: whichever one's
+	// bytes land second is claiming a range that has already arrived.
+	s := newServer(t)
+	const total = 10
+
+	first := chunkWire(t, "overlap.bin", total, 0, 6, []byte("ABCDEF"))
+	dup := chunkWire(t, "overlap.bin", total, 0, 6, []byte("ABCDEF"))
+
+	errs := deliverChunks(t, s, [][]byte{first, dup})
+
+	wantRejected(t, errs, "overlaps")
+
+	if got := entries(t, s.OutDir); len(got) != 0 {
+		t.Errorf("output dir holds %v, want it empty after an aborted transfer", got)
+	}
+}
+
+func TestReceive_RejectsOverlappingChunksEvenWhenTheirLengthsAddUpToTheTotal(t *testing.T) {
+	// [0,6) and [2,6) are 10 bytes between them, the same as the total, but
+	// they cover only the first 6 bytes of the file. counting bytes instead of
+	// ranges would call this done and commit a file with a hole in it.
+	s := newServer(t)
+	const total = 10
+
+	first := chunkWire(t, "gap.bin", total, 0, 6, []byte("ABCDEF"))
+	second := chunkWire(t, "gap.bin", total, 2, 4, []byte("CDEF"))
+
+	errs := deliverChunks(t, s, [][]byte{first, second})
+
+	wantRejected(t, errs, "overlaps")
+
+	if got := entries(t, s.OutDir); len(got) != 0 {
+		t.Errorf("output dir holds %v, want it empty: the file was never fully covered", got)
+	}
+}
+
+func TestReceive_RejectsAChunkThatDisagreesAboutTheTotalSize(t *testing.T) {
+	// the two senders do not have the same file in mind, so neither of them
+	// can be trusted with it.
+	s := newServer(t)
+
+	first := chunkWire(t, "disagree.bin", 10, 0, 4, []byte("ABCD"))
+	if err := deliver(t, s, first); err != nil {
+		t.Fatalf("first receive() error = %v, want nil", err)
+	}
+
+	odd := chunkWire(t, "disagree.bin", 12, 4, 8, []byte("EFGHIJKL"))
+	err := deliver(t, s, odd)
+	if err == nil {
+		t.Fatal("receive() error = nil, want the mismatched total to be rejected")
+	}
+	if !strings.Contains(err.Error(), "total") {
+		t.Errorf("receive() error = %q, want it to mention the totals", err)
+	}
+
+	if got := entries(t, s.OutDir); len(got) != 0 {
+		t.Errorf("output dir holds %v, want it empty after an aborted transfer", got)
+	}
+}
+
+func TestReceive_ForgetsAFailedTransferOnceItsTTLHasPassed(t *testing.T) {
+	// a failed name is rejected for a while, not forever: otherwise one bad
+	// chunk per name would both poison every name and grow the map without
+	// bound.
+	s := newServer(t)
+	s.TransferTTL = 100 * time.Millisecond
+
+	bad := chunkWire(t, "retry.bin", 10, 0, 6, []byte("AB"))
+	if err := deliver(t, s, bad); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("receive() error = %v, want it to wrap %v", err, io.ErrUnexpectedEOF)
+	}
+
+	time.Sleep(3 * s.TransferTTL)
+
+	if err := deliver(t, s, wire(t, "retry.bin", 5, []byte("again"))); err != nil {
+		t.Fatalf("receive() after the ttl error = %v, want nil", err)
+	}
+
+	wantFile(t, s.OutDir, "retry.bin", "again")
+	wantOnly(t, s.OutDir, "retry.bin")
+}
+
+func TestSweep_DropsAStalledTransferAndItsPartFile(t *testing.T) {
+	// a sender that opens a transfer and then goes quiet must not hold an
+	// entry, an open file and a .gshift-part forever.
+	s := newServer(t)
+	s.TransferTTL = 100 * time.Millisecond
+
+	half := chunkWire(t, "stalled.bin", 10, 0, 4, []byte("ABCD"))
+	if err := deliver(t, s, half); err != nil {
+		t.Fatalf("receive() error = %v, want nil", err)
+	}
+	if got := entries(t, s.OutDir); len(got) != 1 {
+		t.Fatalf("output dir holds %v, want the part file while the transfer is under way", got)
+	}
+
+	time.Sleep(3 * s.TransferTTL)
+	s.sweep(time.Now())
+
+	if _, ok := s.chunks.Load("stalled.bin"); ok {
+		t.Error("the stalled transfer is still tracked, want it swept")
+	}
+	if got := entries(t, s.OutDir); len(got) != 0 {
+		t.Errorf("output dir holds %v, want the part file gone with it", got)
+	}
+}
+
+// wantRejected checks that at least one of the chunks was turned away, and that
+// every error blames the same thing.
+func wantRejected(t *testing.T, errs []error, reason string) {
+	t.Helper()
+
+	rejected := false
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		rejected = true
+		if !strings.Contains(err.Error(), reason) {
+			t.Errorf("receive() error = %q, want it to mention %q", err, reason)
+		}
+	}
+	if !rejected {
+		t.Fatalf("want a chunk to be rejected with %q, all of them succeeded", reason)
 	}
 }
 

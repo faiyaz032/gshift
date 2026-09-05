@@ -44,14 +44,16 @@ import (
 // like this it proves the encoder agrees with the *documented format*, and any
 // accidental change to the layout breaks the build for every peer at once.
 var (
-	goldenHeader = Header{Name: "a.txt", Size: 1}
+	goldenHeader = Header{Name: "a.txt", TotalSize: 1, Offset: 0, Length: 1}
 
 	goldenBytes = []byte{
-		'G', 'S', 'H', 'F', // MAGIC   uint32, big endian
-		0x01,       // VERSION uint8
-		0x00, 0x05, // NAMELEN uint16, big endian: len("a.txt")
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // SIZE uint64, big endian
-		'a', '.', 't', 'x', 't', // NAME    NAMELEN bytes, UTF-8
+		'G', 'S', 'H', 'F', // MAGIC     uint32, big endian
+		0x02,       // VERSION   uint8
+		0x00, 0x05, // NAMELEN   uint16, big endian: len("a.txt")
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // TOTALSIZE uint64, big endian
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // OFFSET    uint64, big endian
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // LENGTH    uint64, big endian
+		'a', '.', 't', 'x', 't', // NAME      NAMELEN bytes, UTF-8
 	}
 )
 
@@ -81,7 +83,7 @@ func TestWriteHeader_StartsEveryStreamWithTheAsciiMagicGSHF(t *testing.T) {
 	// The magic is why a browser, a port scanner or a stray HTTP request gets
 	// a clear rejection instead of being parsed as a file transfer.
 	var buf bytes.Buffer
-	if err := WriteHeader(&buf, Header{Name: "x", Size: 1}); err != nil {
+	if err := WriteHeader(&buf, Header{Name: "x", TotalSize: 1, Length: 1}); err != nil {
 		t.Fatalf("WriteHeader() error = %v, want nil", err)
 	}
 
@@ -95,7 +97,7 @@ func TestFixedHeaderSize_MatchesTheBytesActuallyWritten(t *testing.T) {
 	// length, so the constant drifting away from the encoder would desynchronize
 	// every peer. One byte of name makes the arithmetic below exact.
 	var buf bytes.Buffer
-	if err := WriteHeader(&buf, Header{Name: "x", Size: 1}); err != nil {
+	if err := WriteHeader(&buf, Header{Name: "x", TotalSize: 1, Length: 1}); err != nil {
 		t.Fatalf("WriteHeader() error = %v, want nil", err)
 	}
 
@@ -116,37 +118,42 @@ func TestWriteHeader_EncodesEveryFieldOfTheHeader(t *testing.T) {
 	}{
 		{
 			name:        "a short ascii name",
-			header:      Header{Name: "a.txt", Size: 1},
+			header:      Header{Name: "a.txt", TotalSize: 1, Length: 1},
 			wantNameLen: 5,
 		},
 		{
 			name:        "path separators are just bytes to the encoder, SafeName cleans them on receipt",
-			header:      Header{Name: "dir/sub/file.bin", Size: 4096},
+			header:      Header{Name: "dir/sub/file.bin", TotalSize: 4096, Length: 4096},
 			wantNameLen: 16,
 		},
 		{
 			name:        "NAMELEN counts bytes, not runes",
-			header:      Header{Name: "héllo.txt", Size: 12},
+			header:      Header{Name: "héllo.txt", TotalSize: 12, Length: 12},
 			wantNameLen: 10, // é is two bytes in UTF-8
 		},
 		{
 			name:        "SIZE 0, an empty file",
-			header:      Header{Name: "empty.txt", Size: 0},
+			header:      Header{Name: "empty.txt", TotalSize: 0, Length: 0},
 			wantNameLen: 9,
 		},
 		{
 			name:        "the shortest legal name is one byte",
-			header:      Header{Name: "x", Size: 1},
+			header:      Header{Name: "x", TotalSize: 1, Length: 1},
 			wantNameLen: 1,
 		},
 		{
 			name:        "the longest legal name is MaxNameLen bytes",
-			header:      Header{Name: strings.Repeat("n", MaxNameLen), Size: 1},
+			header:      Header{Name: strings.Repeat("n", MaxNameLen), TotalSize: 1, Length: 1},
 			wantNameLen: MaxNameLen,
 		},
 		{
 			name:        "the largest legal size is MaxFileSize",
-			header:      Header{Name: "big.bin", Size: MaxFileSize},
+			header:      Header{Name: "big.bin", TotalSize: MaxFileSize, Length: MaxFileSize},
+			wantNameLen: 7,
+		},
+		{
+			name:        "a chunk that starts mid file",
+			header:      Header{Name: "big.bin", TotalSize: 100, Offset: 40, Length: 60},
 			wantNameLen: 7,
 		},
 	}
@@ -169,8 +176,14 @@ func TestWriteHeader_EncodesEveryFieldOfTheHeader(t *testing.T) {
 			if got.nameLen != tt.wantNameLen {
 				t.Errorf("NAMELEN = %d, want %d", got.nameLen, tt.wantNameLen)
 			}
-			if got.size != uint64(tt.header.Size) {
-				t.Errorf("SIZE = %d, want %d", got.size, tt.header.Size)
+			if got.totalSize != uint64(tt.header.TotalSize) {
+				t.Errorf("TOTALSIZE = %d, want %d", got.totalSize, tt.header.TotalSize)
+			}
+			if got.offset != uint64(tt.header.Offset) {
+				t.Errorf("OFFSET = %d, want %d", got.offset, tt.header.Offset)
+			}
+			if got.length != uint64(tt.header.Length) {
+				t.Errorf("LENGTH = %d, want %d", got.length, tt.header.Length)
 			}
 			if got.name != tt.header.Name {
 				t.Errorf("NAME = %q, want %q", got.name, tt.header.Name)
@@ -190,48 +203,68 @@ func TestWriteHeader_RejectsInvalidHeadersWithoutWritingAnything(t *testing.T) {
 	}{
 		{
 			name:    "a name must not be empty",
-			header:  Header{Name: "", Size: 1},
+			header:  Header{Name: "", TotalSize: 1, Length: 1},
 			wantErr: ErrBadName,
 		},
 		{
 			name:    "a name must not exceed MaxNameLen",
-			header:  Header{Name: strings.Repeat("n", MaxNameLen+1), Size: 1},
+			header:  Header{Name: strings.Repeat("n", MaxNameLen+1), TotalSize: 1, Length: 1},
 			wantErr: ErrBadName,
 		},
 		{
 			name:    "the MaxNameLen limit is in bytes, so multi byte names hit it sooner",
-			header:  Header{Name: strings.Repeat("é", MaxNameLen/2+1), Size: 1},
+			header:  Header{Name: strings.Repeat("é", MaxNameLen/2+1), TotalSize: 1, Length: 1},
 			wantErr: ErrBadName,
 		},
 		{
 			// Go strings can hold arbitrary bytes, so this is reachable from a
 			// caller. ReadHeader would reject the result, so we refuse to send it.
 			name:    "a name must be valid UTF-8",
-			header:  Header{Name: "\xff\xfe", Size: 1},
+			header:  Header{Name: "\xff\xfe", TotalSize: 1, Length: 1},
 			wantErr: ErrBadName,
 		},
 		{
 			// Size is signed on the way in but unsigned on the wire, so a
 			// negative size that slipped through would be encoded as an
 			// enormous one. It is refused, and reported as a size limit error.
-			name:    "a size must not be negative",
-			header:  Header{Name: "a.txt", Size: -1},
+			name:    "a total size must not be negative",
+			header:  Header{Name: "a.txt", TotalSize: -1},
 			wantErr: ErrSizeTooLarge,
 		},
 		{
 			name:    "the most negative size, which would wrap to 2^63 on the wire",
-			header:  Header{Name: "a.txt", Size: math.MinInt64},
+			header:  Header{Name: "a.txt", TotalSize: math.MinInt64},
 			wantErr: ErrSizeTooLarge,
 		},
 		{
-			name:    "a size must not exceed MaxFileSize",
-			header:  Header{Name: "big.bin", Size: MaxFileSize + 1},
+			name:    "a total size must not exceed MaxFileSize",
+			header:  Header{Name: "big.bin", TotalSize: MaxFileSize + 1, Length: MaxFileSize + 1},
 			wantErr: ErrSizeTooLarge,
 		},
 		{
 			name:    "the name is validated before the size",
-			header:  Header{Name: "", Size: -1},
+			header:  Header{Name: "", TotalSize: -1},
 			wantErr: ErrBadName,
+		},
+		{
+			name:    "an offset must not be negative",
+			header:  Header{Name: "a.txt", TotalSize: 10, Offset: -1, Length: 5},
+			wantErr: ErrBadRange,
+		},
+		{
+			name:    "a length must not be negative",
+			header:  Header{Name: "a.txt", TotalSize: 10, Length: -1},
+			wantErr: ErrBadRange,
+		},
+		{
+			name:    "offset plus length must not exceed the total size",
+			header:  Header{Name: "a.txt", TotalSize: 10, Offset: 5, Length: 6},
+			wantErr: ErrBadRange,
+		},
+		{
+			name:    "the size is validated before the range",
+			header:  Header{Name: "a.txt", TotalSize: -1, Offset: -1},
+			wantErr: ErrSizeTooLarge,
 		},
 	}
 
@@ -260,7 +293,7 @@ func TestWriteHeader_EmitsTheWholeHeaderInASingleWriteCall(t *testing.T) {
 	var w countingWriter
 
 	const name = "a.txt"
-	if err := WriteHeader(&w, Header{Name: name, Size: 1}); err != nil {
+	if err := WriteHeader(&w, Header{Name: name, TotalSize: 1, Length: 1}); err != nil {
 		t.Fatalf("WriteHeader() error = %v, want nil", err)
 	}
 
@@ -278,7 +311,7 @@ func TestWriteHeader_AppendsToTheWriterAndNeverRewindsIt(t *testing.T) {
 	var buf bytes.Buffer
 	buf.WriteString("PRELUDE")
 
-	if err := WriteHeader(&buf, Header{Name: "a.txt", Size: 1}); err != nil {
+	if err := WriteHeader(&buf, Header{Name: "a.txt", TotalSize: 1, Length: 1}); err != nil {
 		t.Fatalf("WriteHeader() error = %v, want nil", err)
 	}
 
@@ -295,7 +328,7 @@ func TestWriteHeader_WrapsTheWritersErrorAndAddsContext(t *testing.T) {
 	// errors.Is(err, net.ErrClosed) three layers up the stack.
 	sentinel := errors.New("disk on fire")
 
-	err := WriteHeader(errWriter{err: sentinel}, Header{Name: "a.txt", Size: 1})
+	err := WriteHeader(errWriter{err: sentinel}, Header{Name: "a.txt", TotalSize: 1, Length: 1})
 	if err == nil {
 		t.Fatal("WriteHeader() error = nil, want the writer's error")
 	}
@@ -314,12 +347,14 @@ func TestWriteHeader_WrapsTheWritersErrorAndAddsContext(t *testing.T) {
 func TestReadHeader_RoundTripsEveryHeaderWriteHeaderAccepts(t *testing.T) {
 	// The property that matters between two peers: decode(encode(h)) == h.
 	headers := []Header{
-		{Name: "a.txt", Size: 1},
-		{Name: "dir/sub/file.bin", Size: 4096},
-		{Name: "héllo.txt", Size: 12},
-		{Name: "x", Size: 1},
-		{Name: strings.Repeat("n", MaxNameLen), Size: 1},
-		{Name: "big.bin", Size: MaxFileSize},
+		{Name: "a.txt", TotalSize: 1, Length: 1},
+		{Name: "dir/sub/file.bin", TotalSize: 4096, Length: 4096},
+		{Name: "héllo.txt", TotalSize: 12, Length: 12},
+		{Name: "x", TotalSize: 1, Length: 1},
+		{Name: strings.Repeat("n", MaxNameLen), TotalSize: 1, Length: 1},
+		{Name: "big.bin", TotalSize: MaxFileSize, Length: MaxFileSize},
+		{Name: "big.bin", TotalSize: 100, Offset: 40, Length: 60},
+		{Name: "empty.txt", TotalSize: 0},
 	}
 
 	for _, want := range headers {
@@ -365,9 +400,9 @@ func TestReadHeader_RejectsStreamsThatDoNotStartWithGSHF(t *testing.T) {
 }
 
 func TestReadHeader_RejectsVersionsItDoesNotSpeak(t *testing.T) {
-	// Version 1 is the only format this build understands. A newer peer gets a
-	// clear mismatch rather than a misparse.
-	for _, version := range []uint8{0, Version + 1, 255} {
+	// Version 2 is the only format this build understands. A newer or older peer
+	// gets a clear mismatch rather than a misparse.
+	for _, version := range []uint8{0, 1, Version + 1, 255} {
 		r := validRaw()
 		r.version = version
 
@@ -419,13 +454,15 @@ func TestReadHeader_AcceptsAnySizeUpToMaxFileSizeIncludingZero(t *testing.T) {
 		{name: "one byte", size: 1},
 		{name: "exactly MaxFileSize", size: MaxFileSize},
 		{name: "one byte over MaxFileSize", size: MaxFileSize + 1, wantErr: ErrSizeTooLarge},
-		{name: "the largest value SIZE can hold", size: ^uint64(0), wantErr: ErrSizeTooLarge},
+		{name: "the largest value TOTALSIZE can hold", size: ^uint64(0), wantErr: ErrSizeTooLarge},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := validRaw()
-			r.size = tt.size
+			r.totalSize = tt.size
+			r.offset = 0
+			r.length = 0
 
 			got, err := ReadHeader(bytes.NewReader(r.encode()))
 			if tt.wantErr != nil {
@@ -437,10 +474,52 @@ func TestReadHeader_AcceptsAnySizeUpToMaxFileSizeIncludingZero(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ReadHeader() error = %v, want nil", err)
 			}
-			if got.Size != int64(tt.size) {
-				t.Errorf("Size = %d, want %d", got.Size, tt.size)
+			if got.TotalSize != int64(tt.size) {
+				t.Errorf("TotalSize = %d, want %d", got.TotalSize, tt.size)
 			}
 		})
+	}
+}
+
+func TestReadHeader_RejectsARangeThatDoesNotFitWithinTheTotalSize(t *testing.T) {
+	tests := []struct {
+		name            string
+		total, off, len uint64
+	}{
+		{name: "offset alone exceeds the total", total: 10, off: 11, len: 0},
+		{name: "offset equals the total but length is not zero", total: 10, off: 10, len: 1},
+		{name: "offset plus length overflows past the total", total: 10, off: 5, len: 6},
+		{name: "length alone exceeds the total", total: 10, off: 0, len: 11},
+		{name: "offset and length would overflow uint64 if added directly", total: 10, off: ^uint64(0), len: 5},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := validRaw()
+			r.totalSize = tt.total
+			r.offset = tt.off
+			r.length = tt.len
+
+			_, err := ReadHeader(bytes.NewReader(r.encode()))
+			if !errors.Is(err, ErrBadRange) {
+				t.Errorf("ReadHeader() error = %v, want it to wrap %v", err, ErrBadRange)
+			}
+		})
+	}
+}
+
+func TestReadHeader_AcceptsAChunkThatExactlyFillsTheTotalSize(t *testing.T) {
+	r := validRaw()
+	r.totalSize = 100
+	r.offset = 40
+	r.length = 60
+
+	got, err := ReadHeader(bytes.NewReader(r.encode()))
+	if err != nil {
+		t.Fatalf("ReadHeader() error = %v, want nil", err)
+	}
+	if got.Offset != 40 || got.Length != 60 || got.TotalSize != 100 {
+		t.Errorf("Offset/Length/TotalSize = %d/%d/%d, want 40/60/100", got.Offset, got.Length, got.TotalSize)
 	}
 }
 
@@ -551,7 +630,7 @@ func TestReadHeader_StopsAtTheEndOfTheNameAndLeavesThePayloadInTheStream(t *test
 	const payload = "PAYLOAD"
 
 	var buf bytes.Buffer
-	if err := WriteHeader(&buf, Header{Name: "a.txt", Size: int64(len(payload))}); err != nil {
+	if err := WriteHeader(&buf, Header{Name: "a.txt", TotalSize: int64(len(payload)), Length: int64(len(payload))}); err != nil {
 		t.Fatalf("WriteHeader() error = %v, want nil", err)
 	}
 	buf.WriteString(payload)
@@ -572,11 +651,12 @@ func TestReadHeader_StopsAtTheEndOfTheNameAndLeavesThePayloadInTheStream(t *test
 
 func TestReadHeader_DecodesBackToBackHeadersWithoutResynchronizing(t *testing.T) {
 	// Framing: because every header carries its own lengths, many of them can
-	// share one connection. Phase 2 depends entirely on this property.
+	// share one connection. Chunked transfers depend entirely on this property,
+	// even though each chunk here happens to dial its own connection.
 	want := []Header{
-		{Name: "first.txt", Size: 1},
-		{Name: "second.bin", Size: 4096},
-		{Name: "héllo.txt", Size: 12},
+		{Name: "first.txt", TotalSize: 1, Length: 1},
+		{Name: "second.bin", TotalSize: 4096, Length: 4096},
+		{Name: "héllo.txt", TotalSize: 12, Length: 12},
 	}
 
 	var buf bytes.Buffer
@@ -605,7 +685,7 @@ func TestReadHeader_ReassemblesAHeaderDeliveredOneByteAtATime(t *testing.T) {
 	// no error. Code that assumes "one Read is one message" works on localhost
 	// and fails on a real network. iotest.OneByteReader simulates the worst case
 	// so the guarantee is checked on every run, not hoped for.
-	want := Header{Name: "héllo.txt", Size: 4096}
+	want := Header{Name: "héllo.txt", TotalSize: 4096, Length: 4096}
 
 	var buf bytes.Buffer
 	if err := WriteHeader(&buf, want); err != nil {
@@ -647,20 +727,29 @@ func TestReadHeader_ChecksFieldsInWireOrder(t *testing.T) {
 			wantErr: ErrBadVersion,
 		},
 		{
-			name: "the name length is checked before the size",
+			name: "the name length is checked before the total size",
 			mutate: func(r *rawHeader) {
 				r.nameLen = 0
-				r.size = MaxFileSize + 1
+				r.totalSize = MaxFileSize + 1
 			},
 			wantErr: ErrBadName,
 		},
 		{
-			name: "the size is checked before any name bytes are read",
+			name: "the total size is checked before the range",
 			mutate: func(r *rawHeader) {
-				r.size = MaxFileSize + 1
-				r.name = nil // would be an unexpected EOF if we got that far
+				r.totalSize = MaxFileSize + 1
+				r.offset = ^uint64(0) // would also fail the range check
 			},
 			wantErr: ErrSizeTooLarge,
+		},
+		{
+			name: "the range is checked before any name bytes are read",
+			mutate: func(r *rawHeader) {
+				r.offset = 11
+				r.totalSize = 10
+				r.name = nil // would be an unexpected EOF if we got that far
+			},
+			wantErr: ErrBadRange,
 		},
 	}
 
@@ -810,15 +899,19 @@ func TestSafeName_TreatsBackslashesAsOrdinaryCharactersOnUnix(t *testing.T) {
 
 // FuzzWriteHeader asserts: anything WriteHeader accepts, it encodes faithfully.
 func FuzzWriteHeader(f *testing.F) {
-	f.Add("a.txt", int64(1))
-	f.Add("héllo.txt", int64(4096))
-	f.Add(strings.Repeat("n", MaxNameLen), int64(MaxFileSize))
-	f.Add("empty.txt", int64(0))
+	f.Add("a.txt", int64(1), int64(0), int64(1))
+	f.Add("héllo.txt", int64(4096), int64(0), int64(4096))
+	f.Add(strings.Repeat("n", MaxNameLen), int64(MaxFileSize), int64(0), int64(MaxFileSize))
+	f.Add("empty.txt", int64(0), int64(0), int64(0))
+	f.Add("chunk.bin", int64(100), int64(40), int64(60))
 
-	f.Fuzz(func(t *testing.T, name string, size int64) {
+	f.Fuzz(func(t *testing.T, name string, totalSize, offset, length int64) {
 		// Only inputs WriteHeader is documented to accept are in scope here;
 		// the rejections are covered by the table tests above.
-		if size < 0 || size > MaxFileSize {
+		if totalSize < 0 || totalSize > MaxFileSize {
+			t.Skip()
+		}
+		if offset < 0 || length < 0 || offset > totalSize-length {
 			t.Skip()
 		}
 		if n := len(name); n == 0 || n > MaxNameLen {
@@ -828,9 +921,11 @@ func FuzzWriteHeader(f *testing.F) {
 			t.Skip()
 		}
 
+		h := Header{Name: name, TotalSize: totalSize, Offset: offset, Length: length}
+
 		var buf bytes.Buffer
-		if err := WriteHeader(&buf, Header{Name: name, Size: size}); err != nil {
-			t.Fatalf("WriteHeader(%q, %d) error = %v, want nil", name, size, err)
+		if err := WriteHeader(&buf, h); err != nil {
+			t.Fatalf("WriteHeader(%+v) error = %v, want nil", h, err)
 		}
 
 		got := decodeHeader(t, buf.Bytes())
@@ -840,8 +935,14 @@ func FuzzWriteHeader(f *testing.F) {
 		if got.name != name {
 			t.Errorf("NAME = %q, want %q", got.name, name)
 		}
-		if got.size != uint64(size) {
-			t.Errorf("SIZE = %d, want %d", got.size, size)
+		if got.totalSize != uint64(totalSize) {
+			t.Errorf("TOTALSIZE = %d, want %d", got.totalSize, totalSize)
+		}
+		if got.offset != uint64(offset) {
+			t.Errorf("OFFSET = %d, want %d", got.offset, offset)
+		}
+		if got.length != uint64(length) {
+			t.Errorf("LENGTH = %d, want %d", got.length, length)
 		}
 	})
 }
@@ -859,6 +960,12 @@ func FuzzReadHeader(f *testing.F) {
 	invalidUTF8Name.nameLen = 1
 	f.Add(invalidUTF8Name.encode())
 
+	chunk := validRaw()
+	chunk.totalSize = 100
+	chunk.offset = 40
+	chunk.length = 60
+	f.Add(chunk.encode())
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		h, err := ReadHeader(bytes.NewReader(data))
 		if err != nil {
@@ -868,8 +975,11 @@ func FuzzReadHeader(f *testing.F) {
 		if n := len(h.Name); n == 0 || n > MaxNameLen {
 			t.Errorf("accepted a name of %d bytes, want 1..%d", n, MaxNameLen)
 		}
-		if h.Size < 0 || h.Size > MaxFileSize {
-			t.Errorf("accepted size %d, want 0..%d", h.Size, MaxFileSize)
+		if h.TotalSize < 0 || h.TotalSize > MaxFileSize {
+			t.Errorf("accepted total size %d, want 0..%d", h.TotalSize, MaxFileSize)
+		}
+		if h.Offset < 0 || h.Length < 0 || h.Offset+h.Length > h.TotalSize {
+			t.Errorf("accepted offset %d, length %d outside 0..TotalSize (%d)", h.Offset, h.Length, h.TotalSize)
 		}
 
 		var buf bytes.Buffer
@@ -926,11 +1036,13 @@ func FuzzSafeName(f *testing.F) {
 // decodedHeader mirrors the wire format field by field, so a failing test can
 // say "NAMELEN = 6, want 5" instead of printing two opaque byte slices.
 type decodedHeader struct {
-	magic   uint32
-	version uint8
-	nameLen uint16
-	size    uint64
-	name    string
+	magic     uint32
+	version   uint8
+	nameLen   uint16
+	totalSize uint64
+	offset    uint64
+	length    uint64
+	name      string
 }
 
 // decodeHeader splits a buffer written by WriteHeader into its fields, failing
@@ -946,10 +1058,12 @@ func decodeHeader(t *testing.T, b []byte) decodedHeader {
 	}
 
 	d := decodedHeader{
-		magic:   binary.BigEndian.Uint32(b[0:4]),
-		version: b[4],
-		nameLen: binary.BigEndian.Uint16(b[5:7]),
-		size:    binary.BigEndian.Uint64(b[7:FixedHeaderSize]),
+		magic:     binary.BigEndian.Uint32(b[0:4]),
+		version:   b[4],
+		nameLen:   binary.BigEndian.Uint16(b[5:7]),
+		totalSize: binary.BigEndian.Uint64(b[7:15]),
+		offset:    binary.BigEndian.Uint64(b[15:23]),
+		length:    binary.BigEndian.Uint64(b[23:31]),
 	}
 
 	if got, want := len(b), FixedHeaderSize+int(d.nameLen); got != want {
@@ -963,22 +1077,26 @@ func decodeHeader(t *testing.T, b []byte) decodedHeader {
 // rawHeader builds header bytes field by field, bypassing WriteHeader's
 // validation, so tests can hand ReadHeader wire data no honest peer would send.
 type rawHeader struct {
-	magic   uint32
-	version uint8
-	nameLen uint16
-	size    uint64
-	name    []byte
+	magic     uint32
+	version   uint8
+	nameLen   uint16
+	totalSize uint64
+	offset    uint64
+	length    uint64
+	name      []byte
 }
 
 // validRaw returns a well formed header. Each test mutates exactly the one
 // field it is about, which is what makes the test names true.
 func validRaw() rawHeader {
 	return rawHeader{
-		magic:   Magic,
-		version: Version,
-		nameLen: 5,
-		size:    1,
-		name:    []byte("a.txt"),
+		magic:     Magic,
+		version:   Version,
+		nameLen:   5,
+		totalSize: 1,
+		offset:    0,
+		length:    1,
+		name:      []byte("a.txt"),
 	}
 }
 
@@ -989,7 +1107,9 @@ func (r rawHeader) encode() []byte {
 	buf = binary.BigEndian.AppendUint32(buf, r.magic)
 	buf = append(buf, r.version)
 	buf = binary.BigEndian.AppendUint16(buf, r.nameLen)
-	buf = binary.BigEndian.AppendUint64(buf, r.size)
+	buf = binary.BigEndian.AppendUint64(buf, r.totalSize)
+	buf = binary.BigEndian.AppendUint64(buf, r.offset)
+	buf = binary.BigEndian.AppendUint64(buf, r.length)
 	buf = append(buf, r.name...)
 	return buf
 }
