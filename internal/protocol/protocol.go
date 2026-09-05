@@ -12,44 +12,37 @@ import (
 )
 
 const (
-	// Magic is the first four bytes of every gshift stream: ASCII "GSHF".
 	Magic uint32 = 0x47534846
 
-	// Version is the wire format version this build speaks.
-	Version uint8 = 1
+	Version uint8 = 2
 
-	// FixedHeaderSize is the header size up to, but not including, the name.
-	FixedHeaderSize = 4 + 1 + 2 + 8
+	FixedHeaderSize = 4 + 1 + 2 + 8 + 8 + 8
 
-	// MaxNameLen is the largest file name, in bytes, that a header may carry.
 	MaxNameLen = 1024
 
-	// MaxFileSize is the largest payload, in bytes, that a header may declare.
 	MaxFileSize = 1 << 40
 )
 
 var (
-	// ErrBadMagic reports a stream that does not begin with Magic.
 	ErrBadMagic = errors.New("protocol: not a gshift stream")
 
-	// ErrBadVersion reports a wire format version this build does not speak.
 	ErrBadVersion = errors.New("protocol: unsupported version")
 
-	// ErrBadName reports a file name that is empty, too long, not valid UTF-8,
-	// or unusable as a single path element.
 	ErrBadName = errors.New("protocol: invalid file name")
 
-	// ErrSizeTooLarge reports a payload length outside 0..MaxFileSize.
 	ErrSizeTooLarge = errors.New("protocol: declared size exceeds limit")
+
+	ErrBadRange = errors.New("protocol: invalid chunk range")
 )
 
-// Header describes a single file transfer.
 type Header struct {
-	// Name is the file name, with no directory components.
 	Name string
 
-	// Size is the payload length in bytes.
-	Size int64
+	TotalSize int64
+
+	Offset int64
+
+	Length int64
 }
 
 // WriteHeader encodes h onto w in a single Write. It reports ErrBadName or
@@ -64,15 +57,20 @@ func WriteHeader(w io.Writer, h Header) error {
 		return fmt.Errorf("%w: not valid UTF-8", ErrBadName)
 	}
 
-	if h.Size < 0 || h.Size > MaxFileSize {
-		return fmt.Errorf("%w: %d", ErrSizeTooLarge, h.Size)
+	if h.TotalSize < 0 || h.TotalSize > MaxFileSize {
+		return fmt.Errorf("%w: %d", ErrSizeTooLarge, h.TotalSize)
+	}
+	if h.Offset < 0 || h.Length < 0 || h.Offset+h.Length > h.TotalSize {
+		return fmt.Errorf("%w: offset %d, length %d, total %d", ErrBadRange, h.Offset, h.Length, h.TotalSize)
 	}
 
 	buf := make([]byte, 0, FixedHeaderSize+nameLen)
 	buf = binary.BigEndian.AppendUint32(buf, Magic)
 	buf = append(buf, Version)
 	buf = binary.BigEndian.AppendUint16(buf, uint16(nameLen))
-	buf = binary.BigEndian.AppendUint64(buf, uint64(h.Size))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(h.TotalSize))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(h.Offset))
+	buf = binary.BigEndian.AppendUint64(buf, uint64(h.Length))
 	buf = append(buf, name...)
 
 	if _, err := w.Write(buf); err != nil {
@@ -102,14 +100,20 @@ func ReadHeader(r io.Reader) (Header, error) {
 	}
 
 	nameLen := binary.BigEndian.Uint16(fixed[5:7])
-	size := binary.BigEndian.Uint64(fixed[7:15])
+	totalSize := binary.BigEndian.Uint64(fixed[7:15])
+	offset := binary.BigEndian.Uint64(fixed[15:23])
+	length := binary.BigEndian.Uint64(fixed[23:31])
 
 	if nameLen == 0 || nameLen > MaxNameLen {
 		return Header{}, fmt.Errorf("%w: length %d", ErrBadName, nameLen)
 	}
 
-	if size > MaxFileSize {
-		return Header{}, fmt.Errorf("%w: %d", ErrSizeTooLarge, size)
+	if totalSize > MaxFileSize {
+		return Header{}, fmt.Errorf("%w: %d", ErrSizeTooLarge, totalSize)
+	}
+
+	if offset > totalSize || length > totalSize-offset {
+		return Header{}, fmt.Errorf("%w: offset %d, length %d, total %d", ErrBadRange, offset, length, totalSize)
 	}
 
 	name := make([]byte, nameLen)
@@ -120,7 +124,12 @@ func ReadHeader(r io.Reader) (Header, error) {
 		return Header{}, fmt.Errorf("%w: not valid UTF-8", ErrBadName)
 	}
 
-	return Header{Name: string(name), Size: int64(size)}, nil
+	return Header{
+		Name:      string(name),
+		TotalSize: int64(totalSize),
+		Offset:    int64(offset),
+		Length:    int64(length),
+	}, nil
 }
 
 // SafeName reduces a peer-supplied name to a single path element that cannot

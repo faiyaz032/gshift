@@ -207,7 +207,7 @@ func TestParseServe_TreatsHelpAsARequestNotAMistake(t *testing.T) {
 }
 
 func TestParseSend_ReturnsTheArgumentsInTheOrderTyped(t *testing.T) {
-	src, addr, err := parseSend([]string{"blob.bin", "localhost:9000"})
+	src, addr, parallel, err := parseSend([]string{"blob.bin", "localhost:9000"})
 	if err != nil {
 		t.Fatalf("parseSend() error = %v, want nil", err)
 	}
@@ -216,6 +216,33 @@ func TestParseSend_ReturnsTheArgumentsInTheOrderTyped(t *testing.T) {
 	}
 	if addr != "localhost:9000" {
 		t.Errorf("addr = %q, want %q", addr, "localhost:9000")
+	}
+	if parallel != defaultParallel {
+		t.Errorf("parallel = %d, want the default %d", parallel, defaultParallel)
+	}
+}
+
+func TestParseSend_ReadsTheParallelFlag(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want int
+	}{
+		{name: "explicit value before the positionals", args: []string{"-parallel", "8", "blob.bin", "localhost:9000"}, want: 8},
+		{name: "the equals form", args: []string{"--parallel=1", "blob.bin", "localhost:9000"}, want: 1},
+		{name: "not given at all", args: []string{"blob.bin", "localhost:9000"}, want: defaultParallel},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, parallel, err := parseSend(tt.args)
+			if err != nil {
+				t.Fatalf("parseSend(%q) error = %v, want nil", tt.args, err)
+			}
+			if parallel != tt.want {
+				t.Errorf("parallel = %d, want %d", parallel, tt.want)
+			}
+		})
 	}
 }
 
@@ -231,7 +258,7 @@ func TestParseSend_RejectsTheWrongNumberOfArguments(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			src, addr, err := parseSend(tt.args)
+			src, addr, _, err := parseSend(tt.args)
 			if !errors.Is(err, errUsage) {
 				t.Fatalf("parseSend(%q) error = %v, want it to wrap %v", tt.args, err, errUsage)
 			}
@@ -243,7 +270,7 @@ func TestParseSend_RejectsTheWrongNumberOfArguments(t *testing.T) {
 }
 
 func TestParseSend_TreatsHelpAsARequestNotAMistake(t *testing.T) {
-	_, _, err := parseSend([]string{"-h"})
+	_, _, _, err := parseSend([]string{"-h"})
 	if !errors.Is(err, errHelp) {
 		t.Errorf("parseSend() error = %v, want it to wrap %v", err, errHelp)
 	}
