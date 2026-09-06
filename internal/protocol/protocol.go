@@ -1,4 +1,3 @@
-// Package protocol defines the gshift wire format.
 package protocol
 
 import (
@@ -36,17 +35,12 @@ var (
 )
 
 type Header struct {
-	Name string
-
+	Name      string
 	TotalSize int64
-
-	Offset int64
-
-	Length int64
+	Offset    int64
+	Length    int64
 }
 
-// WriteHeader encodes h onto w in a single Write. It reports ErrBadName or
-// ErrSizeTooLarge, without writing anything, for a header it cannot encode.
 func WriteHeader(w io.Writer, h Header) error {
 	name := []byte(h.Name)
 	nameLen := len(name)
@@ -80,9 +74,6 @@ func WriteHeader(w io.Writer, h Header) error {
 	return nil
 }
 
-// ReadHeader decodes one header from r, consuming exactly its bytes and leaving
-// the payload in the stream. It validates every field before returning, and
-// reports the zero Header alongside any error.
 func ReadHeader(r io.Reader) (Header, error) {
 	var fixed [FixedHeaderSize]byte
 
@@ -132,9 +123,6 @@ func ReadHeader(r io.Reader) (Header, error) {
 	}, nil
 }
 
-// SafeName reduces a peer-supplied name to a single path element that cannot
-// escape the destination directory. It reports ErrBadName for a name that
-// reduces to nothing usable, or that contains a NUL byte.
 func SafeName(name string) (string, error) {
 	base := filepath.Base(name)
 	switch {

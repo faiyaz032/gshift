@@ -53,7 +53,7 @@ func splitRanges(size int64, n int) []chunkRange {
 	return ranges
 }
 
-func Send(addr, path string, parallel int) error {
+func SendFile(addr, path string, parallel int) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("client: %w", err)
@@ -92,7 +92,7 @@ func Send(addr, path string, parallel int) error {
 
 	elapsed := time.Since(start)
 	log.Printf("sent %s (%d bytes) in %s over %d connection(s) (%s)",
-		name, size, elapsed.Round(time.Millisecond), len(ranges), rate(size, elapsed))
+		name, size, elapsed.Round(time.Millisecond), len(ranges), formatThroughput(size, elapsed))
 	return nil
 }
 
@@ -121,7 +121,7 @@ func sendChunk(addr, name string, totalSize int64, r chunkRange, f *os.File) err
 	return nil
 }
 
-func rate(n int64, d time.Duration) string {
+func formatThroughput(n int64, d time.Duration) string {
 	if d <= 0 {
 		return "instant"
 	}

@@ -1,15 +1,3 @@
-// These tests are the specification of the sending half of a transfer.
-//
-// Layout, in reading order:
-//
-//  1. Helpers      - a fake server that reads one or more transfers
-//  2. Send         - one file over a single connection, from open to last byte
-//  3. Send, split  - one file split across several connections
-//  4. splitRanges  - how a file size is divided into chunk ranges
-//  5. rate         - the throughput line
-//
-// The fake server is not internal/server on purpose. a client test must not
-// fail because of a bug in the receiver.
 package client
 
 import (
@@ -33,18 +21,12 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// ---------------------------------------------------------------------------
-// 1. Helpers
-// ---------------------------------------------------------------------------
-
-// transfer is what the fake server made of one connection.
 type transfer struct {
 	hdr     protocol.Header
 	payload []byte
 	err     error
 }
 
-// acceptOne serves exactly one connection and reports what arrived on it.
 func acceptOne(t *testing.T) (addr string, received <-chan transfer) {
 	t.Helper()
 
@@ -54,7 +36,6 @@ func acceptOne(t *testing.T) (addr string, received <-chan transfer) {
 	}
 	t.Cleanup(func() { ln.Close() })
 
-	// buffered so the goroutine still finishes if the test fails early
 	out := make(chan transfer, 1)
 
 	go func() {
@@ -68,7 +49,6 @@ func acceptOne(t *testing.T) (addr string, received <-chan transfer) {
 
 		var tr transfer
 		if tr.hdr, tr.err = protocol.ReadHeader(conn); tr.err == nil {
-			// read to EOF, so a client that sent too much would be caught
 			tr.payload, tr.err = io.ReadAll(conn)
 		}
 		out <- tr
@@ -77,8 +57,6 @@ func acceptOne(t *testing.T) (addr string, received <-chan transfer) {
 	return ln.Addr().String(), out
 }
 
-// acceptN serves exactly n connections and reports what arrived on each, in
-// whatever order they were accepted.
 func acceptN(t *testing.T, n int) (addr string, received <-chan transfer) {
 	t.Helper()
 
@@ -111,7 +89,6 @@ func acceptN(t *testing.T, n int) (addr string, received <-chan transfer) {
 	return ln.Addr().String(), out
 }
 
-// mustReceive bounds the wait so a bug fails in seconds, not at the test timeout.
 func mustReceive(t *testing.T, received <-chan transfer) transfer {
 	t.Helper()
 
@@ -137,7 +114,6 @@ func tempFile(t *testing.T, name string, content []byte) string {
 	return path
 }
 
-// deadAddr is an address nothing is listening on.
 func deadAddr(t *testing.T) string {
 	t.Helper()
 
@@ -150,17 +126,13 @@ func deadAddr(t *testing.T) string {
 	return addr
 }
 
-// ---------------------------------------------------------------------------
-// 2. Send
-// ---------------------------------------------------------------------------
-
 func TestSend_WritesTheHeaderThenExactlyTheFileBytes(t *testing.T) {
 	content := []byte("hello there")
 	path := tempFile(t, "notes.txt", content)
 
 	addr, received := acceptOne(t)
-	if err := Send(addr, path, 1); err != nil {
-		t.Fatalf("Send() error = %v, want nil", err)
+	if err := SendFile(addr, path, 1); err != nil {
+		t.Fatalf("SendFile() error = %v, want nil", err)
 	}
 
 	got := mustReceive(t, received)
@@ -173,7 +145,6 @@ func TestSend_WritesTheHeaderThenExactlyTheFileBytes(t *testing.T) {
 }
 
 func TestSend_SendsOnlyTheBaseName(t *testing.T) {
-	// the receiver must not learn the sender's directory layout
 	dir := filepath.Join(t.TempDir(), "deep", "nested")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -184,8 +155,8 @@ func TestSend_SendsOnlyTheBaseName(t *testing.T) {
 	}
 
 	addr, received := acceptOne(t)
-	if err := Send(addr, path, 1); err != nil {
-		t.Fatalf("Send() error = %v, want nil", err)
+	if err := SendFile(addr, path, 1); err != nil {
+		t.Fatalf("SendFile() error = %v, want nil", err)
 	}
 
 	if got := mustReceive(t, received); got.hdr.Name != "report.pdf" {
@@ -197,8 +168,8 @@ func TestSend_SendsAnEmptyFile(t *testing.T) {
 	path := tempFile(t, "empty.bin", nil)
 
 	addr, received := acceptOne(t)
-	if err := Send(addr, path, 1); err != nil {
-		t.Fatalf("Send() error = %v, want nil", err)
+	if err := SendFile(addr, path, 1); err != nil {
+		t.Fatalf("SendFile() error = %v, want nil", err)
 	}
 
 	got := mustReceive(t, received)
@@ -211,7 +182,6 @@ func TestSend_SendsAnEmptyFile(t *testing.T) {
 }
 
 func TestSend_SendsAPayloadLargerThanOneCopyBuffer(t *testing.T) {
-	// past io.Copy's 32 KiB buffer, so the loop runs more than once
 	content := make([]byte, 320*1024)
 	for i := range content {
 		content[i] = byte(i)
@@ -219,8 +189,8 @@ func TestSend_SendsAPayloadLargerThanOneCopyBuffer(t *testing.T) {
 	path := tempFile(t, "big.bin", content)
 
 	addr, received := acceptOne(t)
-	if err := Send(addr, path, 1); err != nil {
-		t.Fatalf("Send() error = %v, want nil", err)
+	if err := SendFile(addr, path, 1); err != nil {
+		t.Fatalf("SendFile() error = %v, want nil", err)
 	}
 
 	got := mustReceive(t, received)
@@ -236,8 +206,8 @@ func TestSend_SendsAUnicodeName(t *testing.T) {
 	path := tempFile(t, "héllo.txt", []byte("x"))
 
 	addr, received := acceptOne(t)
-	if err := Send(addr, path, 1); err != nil {
-		t.Fatalf("Send() error = %v, want nil", err)
+	if err := SendFile(addr, path, 1); err != nil {
+		t.Fatalf("SendFile() error = %v, want nil", err)
 	}
 
 	if got := mustReceive(t, received); got.hdr.Name != "héllo.txt" {
@@ -246,7 +216,6 @@ func TestSend_SendsAUnicodeName(t *testing.T) {
 }
 
 func TestSend_RejectsAnythingThatIsNotARegularFile(t *testing.T) {
-	// all of these fail before a socket is opened, which is why the address is dead
 	tests := []struct {
 		name    string
 		path    func(t *testing.T) string
@@ -266,12 +235,12 @@ func TestSend_RejectsAnythingThatIsNotARegularFile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := Send("127.0.0.1:1", tt.path(t), 1)
+			err := SendFile("127.0.0.1:1", tt.path(t), 1)
 			if err == nil {
-				t.Fatal("Send() error = nil, want a local validation error")
+				t.Fatal("SendFile() error = nil, want a local validation error")
 			}
 			if !strings.Contains(err.Error(), tt.wantMsg) {
-				t.Errorf("Send() error = %q, want it to mention %q", err, tt.wantMsg)
+				t.Errorf("SendFile() error = %q, want it to mention %q", err, tt.wantMsg)
 			}
 		})
 	}
@@ -280,25 +249,24 @@ func TestSend_RejectsAnythingThatIsNotARegularFile(t *testing.T) {
 func TestSend_ReturnsAnErrorWhenNothingIsListening(t *testing.T) {
 	path := tempFile(t, "a.txt", []byte("x"))
 
-	err := Send(deadAddr(t), path, 1)
+	err := SendFile(deadAddr(t), path, 1)
 	if err == nil {
-		t.Fatal("Send() error = nil, want a dial error")
+		t.Fatal("SendFile() error = nil, want a dial error")
 	}
 	if !strings.Contains(err.Error(), "dial") {
-		t.Errorf("Send() error = %q, want it to mention dial", err)
+		t.Errorf("SendFile() error = %q, want it to mention dial", err)
 	}
 }
 
 func TestSend_ReturnsAnErrorForAnUnparseableAddress(t *testing.T) {
 	path := tempFile(t, "a.txt", []byte("x"))
 
-	if err := Send("definitely not an address", path, 1); err == nil {
-		t.Fatal("Send() error = nil, want a dial error")
+	if err := SendFile("definitely not an address", path, 1); err == nil {
+		t.Fatal("SendFile() error = nil, want a dial error")
 	}
 }
 
 func TestSend_ReportsTheServerHangingUpMidTransfer(t *testing.T) {
-	// enough bytes that the write cannot all fit in the socket buffer
 	content := make([]byte, 8<<20)
 	path := tempFile(t, "big.bin", content)
 
@@ -317,14 +285,10 @@ func TestSend_ReportsTheServerHangingUpMidTransfer(t *testing.T) {
 		conn.Close()
 	}()
 
-	if err := Send(ln.Addr().String(), path, 1); err == nil {
-		t.Error("Send() error = nil, want the broken connection to be reported")
+	if err := SendFile(ln.Addr().String(), path, 1); err == nil {
+		t.Error("SendFile() error = nil, want the broken connection to be reported")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// 3. Send, split across several connections
-// ---------------------------------------------------------------------------
 
 func TestSend_SplitsALargeFileAcrossParallelConnections(t *testing.T) {
 	const n = 4
@@ -335,8 +299,8 @@ func TestSend_SplitsALargeFileAcrossParallelConnections(t *testing.T) {
 	path := tempFile(t, "big.bin", content)
 
 	addr, received := acceptN(t, n)
-	if err := Send(addr, path, n); err != nil {
-		t.Fatalf("Send() error = %v, want nil", err)
+	if err := SendFile(addr, path, n); err != nil {
+		t.Fatalf("SendFile() error = %v, want nil", err)
 	}
 
 	transfers := make([]transfer, n)
@@ -372,13 +336,11 @@ func TestSend_SplitsALargeFileAcrossParallelConnections(t *testing.T) {
 }
 
 func TestSend_ClampsParallelismForASmallFile(t *testing.T) {
-	// requesting 8 connections for a 5 byte file must still send it whole,
-	// over a single connection.
 	path := tempFile(t, "small.txt", []byte("hello"))
 
 	addr, received := acceptOne(t)
-	if err := Send(addr, path, 8); err != nil {
-		t.Fatalf("Send() error = %v, want nil", err)
+	if err := SendFile(addr, path, 8); err != nil {
+		t.Fatalf("SendFile() error = %v, want nil", err)
 	}
 
 	got := mustReceive(t, received)
@@ -386,10 +348,6 @@ func TestSend_ClampsParallelismForASmallFile(t *testing.T) {
 		t.Errorf("offset/length = %d/%d, want 0/5 (one connection carrying the whole file)", got.hdr.Offset, got.hdr.Length)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// 4. splitRanges
-// ---------------------------------------------------------------------------
 
 func TestSplitRanges_DividesEvenlyWhenSizeIsAnExactMultipleOfN(t *testing.T) {
 	got := splitRanges(4*minChunkSize, 4)
@@ -405,8 +363,6 @@ func TestSplitRanges_DividesEvenlyWhenSizeIsAnExactMultipleOfN(t *testing.T) {
 }
 
 func TestSplitRanges_SpreadsTheRemainderOverTheEarliestRanges(t *testing.T) {
-	// 3 chunk sized ranges plus a remainder of 10: the remainder must land on
-	// the earliest ranges, not be dropped or piled onto the last one.
 	const n = 3
 	size := int64(n)*minChunkSize + 10
 
@@ -440,8 +396,6 @@ func TestSplitRanges_ReturnsOneEmptyRangeForAnEmptyFile(t *testing.T) {
 }
 
 func TestSplitRanges_ClampsParallelismSoNoChunkFallsBelowMinChunkSize(t *testing.T) {
-	// only 1.5x minChunkSize exists, so 4 requested connections must collapse
-	// down to the 1 that can actually be filled.
 	size := int64(minChunkSize) + int64(minChunkSize)/2
 
 	got := splitRanges(size, 4)
@@ -452,8 +406,6 @@ func TestSplitRanges_ClampsParallelismSoNoChunkFallsBelowMinChunkSize(t *testing
 }
 
 func TestSplitRanges_RangesAreContiguousAndCoverTheWholeFile(t *testing.T) {
-	// the property that matters regardless of the exact split: no gaps, no
-	// overlaps, and the ranges cover exactly size bytes.
 	tests := []struct {
 		size int64
 		n    int
@@ -479,12 +431,7 @@ func TestSplitRanges_RangesAreContiguousAndCoverTheWholeFile(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 5. rate
-// ---------------------------------------------------------------------------
-
 func TestRate_GuardsAgainstAZeroDuration(t *testing.T) {
-	// a coarse clock can report 0 for a small file, and dividing by it prints +Inf
 	tests := []struct {
 		name string
 		n    int64
@@ -499,8 +446,8 @@ func TestRate_GuardsAgainstAZeroDuration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := rate(tt.n, tt.d); got != tt.want {
-				t.Errorf("rate(%d, %v) = %q, want %q", tt.n, tt.d, got, tt.want)
+			if got := formatThroughput(tt.n, tt.d); got != tt.want {
+				t.Errorf("formatThroughput(%d, %v) = %q, want %q", tt.n, tt.d, got, tt.want)
 			}
 		})
 	}

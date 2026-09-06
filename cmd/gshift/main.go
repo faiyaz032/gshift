@@ -1,4 +1,3 @@
-// Command gshift is a fast file transfer tool.
 package main
 
 import (
@@ -43,16 +42,16 @@ var (
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("gshift: ")
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
+func runCLI(args []string, stdout, stderr io.Writer) int {
 	var cmd string
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
 	}
 
-	switch err := execute(cmd, args); {
+	switch err := runCommand(cmd, args); {
 	case err == nil:
 		return exitOK
 	case errors.Is(err, errHelp):
@@ -68,7 +67,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-func execute(cmd string, args []string) error {
+func runCommand(cmd string, args []string) error {
 	switch cmd {
 	case "serve":
 		srv, err := parseServe(args)
@@ -82,7 +81,7 @@ func execute(cmd string, args []string) error {
 		if err != nil {
 			return err
 		}
-		return client.Send(addr, src, parallel)
+		return client.SendFile(addr, src, parallel)
 
 	case "":
 		return fmt.Errorf("%w: no command given", errUsage)
