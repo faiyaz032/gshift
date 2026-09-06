@@ -8,16 +8,16 @@ import (
 	"testing"
 )
 
-func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
+func runAndCapture(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
 
 	var out, errOut bytes.Buffer
-	code = run(args, &out, &errOut)
+	code = runCLI(args, &out, &errOut)
 	return code, out.String(), errOut.String()
 }
 
 func TestRun_WithNoArgumentsPrintsUsageToStderrAndExitsTwo(t *testing.T) {
-	code, stdout, stderr := runCLI(t)
+	code, stdout, stderr := runAndCapture(t)
 
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
@@ -34,7 +34,7 @@ func TestRun_WithNoArgumentsPrintsUsageToStderrAndExitsTwo(t *testing.T) {
 }
 
 func TestRun_WithAnUnknownCommandNamesItAndExitsTwo(t *testing.T) {
-	code, stdout, stderr := runCLI(t, "bogus")
+	code, stdout, stderr := runAndCapture(t, "bogus")
 
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
@@ -50,7 +50,7 @@ func TestRun_WithAnUnknownCommandNamesItAndExitsTwo(t *testing.T) {
 func TestRun_WithHelpPrintsUsageToStdoutAndExitsZero(t *testing.T) {
 	for _, arg := range []string{"-h", "-help", "--help"} {
 		t.Run(arg, func(t *testing.T) {
-			code, stdout, stderr := runCLI(t, "serve", arg)
+			code, stdout, stderr := runAndCapture(t, "serve", arg)
 
 			if code != exitOK {
 				t.Errorf("exit code = %d, want %d", code, exitOK)
@@ -66,7 +66,7 @@ func TestRun_WithHelpPrintsUsageToStdoutAndExitsZero(t *testing.T) {
 }
 
 func TestRun_WithABadFlagReportsItAndExitsTwo(t *testing.T) {
-	code, _, stderr := runCLI(t, "serve", "-nope")
+	code, _, stderr := runAndCapture(t, "serve", "-nope")
 
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
@@ -77,7 +77,7 @@ func TestRun_WithABadFlagReportsItAndExitsTwo(t *testing.T) {
 }
 
 func TestRun_WithAStrayArgumentReportsItAndExitsTwo(t *testing.T) {
-	code, _, stderr := runCLI(t, "serve", "received")
+	code, _, stderr := runAndCapture(t, "serve", "received")
 
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
@@ -88,7 +88,7 @@ func TestRun_WithAStrayArgumentReportsItAndExitsTwo(t *testing.T) {
 }
 
 func TestRun_WhenTheAddressCannotBeBoundExitsOne(t *testing.T) {
-	code, stdout, stderr := runCLI(t, "serve", "-addr", "definitely not an address", "-out", t.TempDir())
+	code, stdout, stderr := runAndCapture(t, "serve", "-addr", "definitely not an address", "-out", t.TempDir())
 
 	if code != exitFailure {
 		t.Errorf("exit code = %d, want %d", code, exitFailure)
@@ -279,7 +279,7 @@ func TestParseSend_TreatsHelpAsARequestNotAMistake(t *testing.T) {
 func TestRun_SendReportsAMissingFileAndExitsOne(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "nope.bin")
 
-	code, _, stderr := runCLI(t, "send", missing, "127.0.0.1:1")
+	code, _, stderr := runAndCapture(t, "send", missing, "127.0.0.1:1")
 	if code != exitFailure {
 		t.Errorf("exit code = %d, want %d", code, exitFailure)
 	}

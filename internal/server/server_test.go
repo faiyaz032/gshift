@@ -1,11 +1,3 @@
-// these tests say what the receiving side must do.
-//
-// order:
-//
-//  1. helpers          fixtures for the tests
-//  2. receive          one file, start to finish
-//  3. Serve            the accept loop
-//  4. ListenAndServe   address handling
 package server
 
 import (
@@ -26,18 +18,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	// the server logs every transfer. turn it off so test output stays readable.
 	log.SetOutput(io.Discard)
 	os.Exit(m.Run())
 }
 
-// ---------------------------------------------------------------------------
-// 1. helpers
-// ---------------------------------------------------------------------------
-
-// wire builds the bytes a sender puts on the connection for a file sent whole,
-// in a single chunk. size goes into the header as given, so it can differ
-// from len(payload) on purpose.
 func wire(t *testing.T, name string, size int64, payload []byte) []byte {
 	t.Helper()
 
@@ -48,14 +32,10 @@ func wire(t *testing.T, name string, size int64, payload []byte) []byte {
 	return b
 }
 
-// encode is wire without a *testing.T, for callers that must not call FailNow.
 func encode(name string, size int64, payload []byte) ([]byte, error) {
 	return chunk(name, size, 0, size, payload)
 }
 
-// chunk builds the bytes for one chunk of a (possibly multi connection)
-// transfer: name and total are the same on every chunk of one file, offset
-// and length describe the slice this chunk carries.
 func chunk(name string, total, offset, length int64, payload []byte) ([]byte, error) {
 	var b bytes.Buffer
 	if err := protocol.WriteHeader(&b, protocol.Header{Name: name, TotalSize: total, Offset: offset, Length: length}); err != nil {
@@ -65,7 +45,6 @@ func chunk(name string, total, offset, length int64, payload []byte) ([]byte, er
 	return b.Bytes(), nil
 }
 
-// chunkWire is chunk, failing the test instead of returning an error.
 func chunkWire(t *testing.T, name string, total, offset, length int64, payload []byte) []byte {
 	t.Helper()
 
@@ -76,9 +55,6 @@ func chunkWire(t *testing.T, name string, total, offset, length int64, payload [
 	return b
 }
 
-// deliverChunks runs receive concurrently, once per entry in wires, against
-// the same server, and returns every call's error in the same order. Use it
-// to drive several connections that carry chunks of the same file.
 func deliverChunks(t *testing.T, s *Server, wires [][]byte) []error {
 	t.Helper()
 
@@ -95,9 +71,6 @@ func deliverChunks(t *testing.T, s *Server, wires [][]byte) []error {
 	return errs
 }
 
-// deliver runs one receive over an in memory connection and returns its error.
-// the write needs its own goroutine because net.Pipe has no buffer. if receive
-// gives up early nobody is reading, so the deadline stops the write hanging.
 func deliver(t *testing.T, s *Server, wire []byte) error {
 	t.Helper()
 
@@ -107,7 +80,7 @@ func deliver(t *testing.T, s *Server, wire []byte) error {
 	_ = srv.SetDeadline(deadline)
 
 	done := make(chan error, 1)
-	go func() { done <- s.receive(srv) }()
+	go func() { done <- s.receiveChunk(srv) }()
 
 	go func() {
 		defer client.Close()
@@ -119,13 +92,11 @@ func deliver(t *testing.T, s *Server, wire []byte) error {
 	return err
 }
 
-// newServer returns a Server that writes into a fresh temp dir.
 func newServer(t *testing.T) *Server {
 	t.Helper()
 	return &Server{OutDir: t.TempDir()}
 }
 
-// entries lists the file names in dir so a test can check what was left behind.
 func entries(t *testing.T, dir string) []string {
 	t.Helper()
 
@@ -141,7 +112,6 @@ func entries(t *testing.T, dir string) []string {
 	return names
 }
 
-// wantFile checks that dir/name exists and holds exactly this content.
 func wantFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 
@@ -154,8 +124,6 @@ func wantFile(t *testing.T, dir, name, content string) {
 	}
 }
 
-// wantOnly checks the out dir holds these names and nothing else. this is how
-// the tests prove no .gshift-part file was left.
 func wantOnly(t *testing.T, dir string, names ...string) {
 	t.Helper()
 
@@ -170,16 +138,12 @@ func wantOnly(t *testing.T, dir string, names ...string) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 2. receive
-// ---------------------------------------------------------------------------
-
 func TestReceive_WritesTheFileAndLeavesNoPartFileBehind(t *testing.T) {
 	s := newServer(t)
 	const payload = "hello there"
 
 	if err := deliver(t, s, wire(t, "notes.txt", int64(len(payload)), []byte(payload))); err != nil {
-		t.Fatalf("receive() error = %v, want nil", err)
+		t.Fatalf("receiveChunk() error = %v, want nil", err)
 	}
 
 	wantFile(t, s.OutDir, "notes.txt", payload)
@@ -187,11 +151,10 @@ func TestReceive_WritesTheFileAndLeavesNoPartFileBehind(t *testing.T) {
 }
 
 func TestReceive_AcceptsAnEmptyFile(t *testing.T) {
-	// SIZE 0 is a valid header, so we should get a real empty file, not nothing.
 	s := newServer(t)
 
 	if err := deliver(t, s, wire(t, "empty.txt", 0, nil)); err != nil {
-		t.Fatalf("receive() error = %v, want nil", err)
+		t.Fatalf("receiveChunk() error = %v, want nil", err)
 	}
 
 	wantFile(t, s.OutDir, "empty.txt", "")
@@ -199,12 +162,11 @@ func TestReceive_AcceptsAnEmptyFile(t *testing.T) {
 }
 
 func TestReceive_WritesALargePayloadIntact(t *testing.T) {
-	// bigger than the 32 KiB copy buffer, so the copy loop runs more than once.
 	s := newServer(t)
-	payload := bytes.Repeat([]byte("abcdefgh"), 40*1024) // 320 KiB
+	payload := bytes.Repeat([]byte("abcdefgh"), 40*1024)
 
 	if err := deliver(t, s, wire(t, "big.bin", int64(len(payload)), payload)); err != nil {
-		t.Fatalf("receive() error = %v, want nil", err)
+		t.Fatalf("receiveChunk() error = %v, want nil", err)
 	}
 
 	got, err := os.ReadFile(filepath.Join(s.OutDir, "big.bin"))
@@ -217,7 +179,6 @@ func TestReceive_WritesALargePayloadIntact(t *testing.T) {
 }
 
 func TestReceive_StripsDirectoriesFromTheName(t *testing.T) {
-	// the security rule end to end. a name with .. in it still lands inside OutDir.
 	tests := []struct {
 		name     string
 		sent     string
@@ -235,7 +196,7 @@ func TestReceive_StripsDirectoriesFromTheName(t *testing.T) {
 			const payload = "x"
 
 			if err := deliver(t, s, wire(t, tt.sent, int64(len(payload)), []byte(payload))); err != nil {
-				t.Fatalf("receive() error = %v, want nil", err)
+				t.Fatalf("receiveChunk() error = %v, want nil", err)
 			}
 
 			wantFile(t, s.OutDir, tt.wantFile, payload)
@@ -261,7 +222,7 @@ func TestReceive_RejectsANameThatIsNotAFile(t *testing.T) {
 
 			err := deliver(t, s, wire(t, tt.sent, 1, []byte("x")))
 			if !errors.Is(err, protocol.ErrBadName) {
-				t.Fatalf("receive() error = %v, want it to wrap %v", err, protocol.ErrBadName)
+				t.Fatalf("receiveChunk() error = %v, want it to wrap %v", err, protocol.ErrBadName)
 			}
 			if got := entries(t, s.OutDir); len(got) != 0 {
 				t.Errorf("output dir holds %v, want it empty", got)
@@ -271,39 +232,33 @@ func TestReceive_RejectsANameThatIsNotAFile(t *testing.T) {
 }
 
 func TestReceive_StopsAtTheDeclaredSize(t *testing.T) {
-	// bytes past SIZE must not be written. this is what stops a bad peer from
-	// filling our disk.
 	s := newServer(t)
 
 	w := wire(t, "a.txt", 5, []byte("hello"))
 	w = append(w, []byte("AND MUCH MORE THAT WAS NEVER PROMISED")...)
 
 	if err := deliver(t, s, w); err != nil {
-		t.Fatalf("receive() error = %v, want nil", err)
+		t.Fatalf("receiveChunk() error = %v, want nil", err)
 	}
 
 	wantFile(t, s.OutDir, "a.txt", "hello")
 }
 
 func TestReceive_RejectsATruncatedPayload(t *testing.T) {
-	// the header promised 20 bytes and only 5 came. nothing should be saved and
-	// no .part left behind.
 	s := newServer(t)
 
 	err := deliver(t, s, wire(t, "a.txt", 20, []byte("short")))
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("receive() error = %v, want it to wrap %v", err, io.ErrUnexpectedEOF)
+		t.Fatalf("receiveChunk() error = %v, want it to wrap %v", err, io.ErrUnexpectedEOF)
 	}
 	if !strings.Contains(err.Error(), "copied 5 of 20 bytes") {
-		t.Errorf("receive() error = %q, want it to say how far it got", err)
+		t.Errorf("receiveChunk() error = %q, want it to say how far it got", err)
 	}
 	if got := entries(t, s.OutDir); len(got) != 0 {
 		t.Errorf("output dir holds %v, want it empty", got)
 	}
 }
 
-// deadlineErrConn is a conn that refuses deadlines. the embedded nil Conn is
-// fine because receive returns before it touches anything else.
 type deadlineErrConn struct {
 	net.Conn
 	err error
@@ -312,13 +267,12 @@ type deadlineErrConn struct {
 func (c deadlineErrConn) SetReadDeadline(time.Time) error { return c.err }
 
 func TestReceive_FailsWhenTheHeaderDeadlineCannotBeSet(t *testing.T) {
-	// no deadline means an unbounded read, so refusing to go on is the point.
 	s := newServer(t)
 	sentinel := errors.New("no deadlines here")
 
-	err := s.receive(deadlineErrConn{err: sentinel})
+	err := s.receiveChunk(deadlineErrConn{err: sentinel})
 	if !errors.Is(err, sentinel) {
-		t.Fatalf("receive() error = %v, want it to wrap %v", err, sentinel)
+		t.Fatalf("receiveChunk() error = %v, want it to wrap %v", err, sentinel)
 	}
 	if got := entries(t, s.OutDir); len(got) != 0 {
 		t.Errorf("output dir holds %v, want it empty", got)
@@ -326,8 +280,6 @@ func TestReceive_FailsWhenTheHeaderDeadlineCannotBeSet(t *testing.T) {
 }
 
 func TestReceive_GivesUpOnAPeerThatSendsNothing(t *testing.T) {
-	// without a deadline a silent peer holds a goroutine forever, so a few
-	// thousand of them is enough to kill the process.
 	s := newServer(t)
 	s.HeaderTimeout = 50 * time.Millisecond
 
@@ -338,14 +290,14 @@ func TestReceive_GivesUpOnAPeerThatSendsNothing(t *testing.T) {
 	})
 
 	start := time.Now()
-	err := s.receive(srv)
+	err := s.receiveChunk(srv)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("receive() error = %v, want it to wrap %v", err, os.ErrDeadlineExceeded)
+		t.Fatalf("receiveChunk() error = %v, want it to wrap %v", err, os.ErrDeadlineExceeded)
 	}
 	if elapsed > 5*time.Second {
-		t.Errorf("receive() took %v, want it to give up after HeaderTimeout", elapsed)
+		t.Errorf("receiveChunk() took %v, want it to give up after HeaderTimeout", elapsed)
 	}
 	if got := entries(t, s.OutDir); len(got) != 0 {
 		t.Errorf("output dir holds %v, want it empty", got)
@@ -353,8 +305,6 @@ func TestReceive_GivesUpOnAPeerThatSendsNothing(t *testing.T) {
 }
 
 func TestReceive_DoesNotApplyTheHeaderTimeoutToTheBody(t *testing.T) {
-	// a big transfer takes longer than any header ever should, so the deadline
-	// has to be cleared once the header is in.
 	s := newServer(t)
 	s.HeaderTimeout = 50 * time.Millisecond
 
@@ -371,8 +321,8 @@ func TestReceive_DoesNotApplyTheHeaderTimeoutToTheBody(t *testing.T) {
 		_, _ = client.Write([]byte(payload))
 	}()
 
-	if err := s.receive(srv); err != nil {
-		t.Fatalf("receive() error = %v, want nil", err)
+	if err := s.receiveChunk(srv); err != nil {
+		t.Fatalf("receiveChunk() error = %v, want nil", err)
 	}
 	wantFile(t, s.OutDir, "slow.txt", payload)
 }
@@ -382,7 +332,7 @@ func TestReceive_RejectsAStreamThatIsNotGshift(t *testing.T) {
 
 	err := deliver(t, s, []byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
 	if !errors.Is(err, protocol.ErrBadMagic) {
-		t.Fatalf("receive() error = %v, want it to wrap %v", err, protocol.ErrBadMagic)
+		t.Fatalf("receiveChunk() error = %v, want it to wrap %v", err, protocol.ErrBadMagic)
 	}
 	if got := entries(t, s.OutDir); len(got) != 0 {
 		t.Errorf("output dir holds %v, want it empty", got)
@@ -396,7 +346,7 @@ func TestReceive_RejectsAHeaderThatEndsEarly(t *testing.T) {
 
 	err := deliver(t, s, full[:4])
 	if err == nil {
-		t.Fatal("receive() error = nil, want a truncated header to fail")
+		t.Fatal("receiveChunk() error = nil, want a truncated header to fail")
 	}
 	if got := entries(t, s.OutDir); len(got) != 0 {
 		t.Errorf("output dir holds %v, want it empty", got)
@@ -404,8 +354,6 @@ func TestReceive_RejectsAHeaderThatEndsEarly(t *testing.T) {
 }
 
 func TestReceive_OverwritesAStalePartFile(t *testing.T) {
-	// a crashed run leaves a .part behind. the next try reuses it and O_TRUNC
-	// means none of the old bytes stay.
 	s := newServer(t)
 
 	stale := filepath.Join(s.OutDir, "a.txt.gshift-part")
@@ -414,7 +362,7 @@ func TestReceive_OverwritesAStalePartFile(t *testing.T) {
 	}
 
 	if err := deliver(t, s, wire(t, "a.txt", 2, []byte("ok"))); err != nil {
-		t.Fatalf("receive() error = %v, want nil", err)
+		t.Fatalf("receiveChunk() error = %v, want nil", err)
 	}
 
 	wantFile(t, s.OutDir, "a.txt", "ok")
@@ -430,7 +378,7 @@ func TestReceive_ReplacesAFileThatAlreadyExists(t *testing.T) {
 	}
 
 	if err := deliver(t, s, wire(t, "a.txt", 3, []byte("new"))); err != nil {
-		t.Fatalf("receive() error = %v, want nil", err)
+		t.Fatalf("receiveChunk() error = %v, want nil", err)
 	}
 
 	wantFile(t, s.OutDir, "a.txt", "new")
@@ -438,8 +386,6 @@ func TestReceive_ReplacesAFileThatAlreadyExists(t *testing.T) {
 }
 
 func TestReceive_FailsWhenTheNameCollidesWithADirectory(t *testing.T) {
-	// the bytes arrive fine but the rename cannot work. nothing is saved and the
-	// .part file is still cleaned up.
 	s := newServer(t)
 
 	if err := os.Mkdir(filepath.Join(s.OutDir, "a.txt"), 0o755); err != nil {
@@ -448,31 +394,25 @@ func TestReceive_FailsWhenTheNameCollidesWithADirectory(t *testing.T) {
 
 	err := deliver(t, s, wire(t, "a.txt", 2, []byte("ok")))
 	if err == nil {
-		t.Fatal("receive() error = nil, want the rename to fail")
+		t.Fatal("receiveChunk() error = nil, want the rename to fail")
 	}
 	if !strings.Contains(err.Error(), "commit") {
-		t.Errorf("receive() error = %q, want it to mention the commit step", err)
+		t.Errorf("receiveChunk() error = %q, want it to mention the commit step", err)
 	}
-	wantOnly(t, s.OutDir, "a.txt") // just the directory, no leftover .part
+	wantOnly(t, s.OutDir, "a.txt")
 }
 
 func TestReceive_FailsWhenTheOutputDirDoesNotExist(t *testing.T) {
-	// receive does not make OutDir, Serve does. point it at a missing dir and the
-	// create error should come back.
 	s := &Server{OutDir: filepath.Join(t.TempDir(), "does-not-exist")}
 
 	err := deliver(t, s, wire(t, "a.txt", 1, []byte("x")))
 	if err == nil {
-		t.Fatal("receive() error = nil, want a create failure")
+		t.Fatal("receiveChunk() error = nil, want a create failure")
 	}
 	if !strings.Contains(err.Error(), "create") {
-		t.Errorf("receive() error = %q, want it to mention the create step", err)
+		t.Errorf("receiveChunk() error = %q, want it to mention the create step", err)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// 2b. chunked transfers: several connections carrying one file
-// ---------------------------------------------------------------------------
 
 func TestReceive_CommitsOnlyOnceEveryChunkHasArrived(t *testing.T) {
 	s := newServer(t)
@@ -483,7 +423,7 @@ func TestReceive_CommitsOnlyOnceEveryChunkHasArrived(t *testing.T) {
 
 	for i, err := range deliverChunks(t, s, [][]byte{first, second}) {
 		if err != nil {
-			t.Fatalf("chunk %d: receive() error = %v, want nil", i, err)
+			t.Fatalf("chunk %d: receiveChunk() error = %v, want nil", i, err)
 		}
 	}
 
@@ -492,8 +432,6 @@ func TestReceive_CommitsOnlyOnceEveryChunkHasArrived(t *testing.T) {
 }
 
 func TestReceive_HandlesManyConcurrentChunksOfTheSameFileWithoutCorruption(t *testing.T) {
-	// each chunk writes to a different slice of the same shared file
-	// concurrently. run this under -race.
 	s := newServer(t)
 
 	const chunkSize = 4096
@@ -509,7 +447,7 @@ func TestReceive_HandlesManyConcurrentChunksOfTheSameFileWithoutCorruption(t *te
 
 	for i, err := range deliverChunks(t, s, wires) {
 		if err != nil {
-			t.Fatalf("chunk %d: receive() error = %v, want nil", i, err)
+			t.Fatalf("chunk %d: receiveChunk() error = %v, want nil", i, err)
 		}
 	}
 
@@ -518,16 +456,10 @@ func TestReceive_HandlesManyConcurrentChunksOfTheSameFileWithoutCorruption(t *te
 }
 
 func TestReceive_OneFailingChunkAbortsTheWholeFileEvenIfOthersSucceeded(t *testing.T) {
-	// "bad" always independently reports io.ErrUnexpectedEOF, since it is the
-	// one violating its own declared length; "good" may additionally report
-	// an error too, if it happens to run after "bad" has already poisoned the
-	// name (see TestReceive_RejectsAChunkForANameWhoseEarlierTransferFailed).
-	// Either way, nothing is ever left on disk.
 	s := newServer(t)
 	const total = 10
 
 	good := chunkWire(t, "abort.bin", total, 0, 4, []byte("ABCD"))
-	// promises 6 bytes at offset 4, but only 2 are ever put on the wire
 	bad := chunkWire(t, "abort.bin", total, 4, 6, []byte("EF"))
 
 	errs := deliverChunks(t, s, [][]byte{good, bad})
@@ -548,20 +480,17 @@ func TestReceive_OneFailingChunkAbortsTheWholeFileEvenIfOthersSucceeded(t *testi
 }
 
 func TestReceive_RejectsAChunkForANameWhoseEarlierTransferFailed(t *testing.T) {
-	// once a transfer under a name has failed, the name stays rejected rather
-	// than silently letting a late chunk start a fresh, doomed transfer under
-	// the same temp file (which would otherwise leak a .gshift-part forever).
 	s := newServer(t)
 	const total = 10
 
 	bad := chunkWire(t, "poisoned.bin", total, 0, 6, []byte("AB"))
 	if err := deliver(t, s, bad); !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("receive() error = %v, want it to wrap %v", err, io.ErrUnexpectedEOF)
+		t.Fatalf("receiveChunk() error = %v, want it to wrap %v", err, io.ErrUnexpectedEOF)
 	}
 
 	late := chunkWire(t, "poisoned.bin", total, 6, 4, []byte("CDEF"))
 	if err := deliver(t, s, late); err == nil {
-		t.Fatal("receive() error = nil, want the poisoned name to be rejected")
+		t.Fatal("receiveChunk() error = nil, want the poisoned name to be rejected")
 	}
 
 	if got := entries(t, s.OutDir); len(got) != 0 {
@@ -573,19 +502,17 @@ func TestReceive_ASuccessfulTransferDoesNotPoisonTheNameForLaterUse(t *testing.T
 	s := newServer(t)
 
 	if err := deliver(t, s, wire(t, "reuse.txt", 5, []byte("first"))); err != nil {
-		t.Fatalf("first receive() error = %v, want nil", err)
+		t.Fatalf("first receiveChunk() error = %v, want nil", err)
 	}
 	wantFile(t, s.OutDir, "reuse.txt", "first")
 
 	if err := deliver(t, s, wire(t, "reuse.txt", 6, []byte("second"))); err != nil {
-		t.Fatalf("second receive() error = %v, want nil", err)
+		t.Fatalf("second receiveChunk() error = %v, want nil", err)
 	}
 	wantFile(t, s.OutDir, "reuse.txt", "second")
 }
 
 func TestReceive_RejectsChunksThatOverlapAndAbortsTheTransfer(t *testing.T) {
-	// two chunks each covering the same range of the file: whichever one's
-	// bytes land second is claiming a range that has already arrived.
 	s := newServer(t)
 	const total = 10
 
@@ -602,9 +529,6 @@ func TestReceive_RejectsChunksThatOverlapAndAbortsTheTransfer(t *testing.T) {
 }
 
 func TestReceive_RejectsOverlappingChunksEvenWhenTheirLengthsAddUpToTheTotal(t *testing.T) {
-	// [0,6) and [2,6) are 10 bytes between them, the same as the total, but
-	// they cover only the first 6 bytes of the file. counting bytes instead of
-	// ranges would call this done and commit a file with a hole in it.
 	s := newServer(t)
 	const total = 10
 
@@ -621,22 +545,20 @@ func TestReceive_RejectsOverlappingChunksEvenWhenTheirLengthsAddUpToTheTotal(t *
 }
 
 func TestReceive_RejectsAChunkThatDisagreesAboutTheTotalSize(t *testing.T) {
-	// the two senders do not have the same file in mind, so neither of them
-	// can be trusted with it.
 	s := newServer(t)
 
 	first := chunkWire(t, "disagree.bin", 10, 0, 4, []byte("ABCD"))
 	if err := deliver(t, s, first); err != nil {
-		t.Fatalf("first receive() error = %v, want nil", err)
+		t.Fatalf("first receiveChunk() error = %v, want nil", err)
 	}
 
 	odd := chunkWire(t, "disagree.bin", 12, 4, 8, []byte("EFGHIJKL"))
 	err := deliver(t, s, odd)
 	if err == nil {
-		t.Fatal("receive() error = nil, want the mismatched total to be rejected")
+		t.Fatal("receiveChunk() error = nil, want the mismatched total to be rejected")
 	}
 	if !strings.Contains(err.Error(), "total") {
-		t.Errorf("receive() error = %q, want it to mention the totals", err)
+		t.Errorf("receiveChunk() error = %q, want it to mention the totals", err)
 	}
 
 	if got := entries(t, s.OutDir); len(got) != 0 {
@@ -645,21 +567,18 @@ func TestReceive_RejectsAChunkThatDisagreesAboutTheTotalSize(t *testing.T) {
 }
 
 func TestReceive_ForgetsAFailedTransferOnceItsTTLHasPassed(t *testing.T) {
-	// a failed name is rejected for a while, not forever: otherwise one bad
-	// chunk per name would both poison every name and grow the map without
-	// bound.
 	s := newServer(t)
 	s.TransferTTL = 100 * time.Millisecond
 
 	bad := chunkWire(t, "retry.bin", 10, 0, 6, []byte("AB"))
 	if err := deliver(t, s, bad); !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("receive() error = %v, want it to wrap %v", err, io.ErrUnexpectedEOF)
+		t.Fatalf("receiveChunk() error = %v, want it to wrap %v", err, io.ErrUnexpectedEOF)
 	}
 
 	time.Sleep(3 * s.TransferTTL)
 
 	if err := deliver(t, s, wire(t, "retry.bin", 5, []byte("again"))); err != nil {
-		t.Fatalf("receive() after the ttl error = %v, want nil", err)
+		t.Fatalf("receiveChunk() after the ttl error = %v, want nil", err)
 	}
 
 	wantFile(t, s.OutDir, "retry.bin", "again")
@@ -667,14 +586,12 @@ func TestReceive_ForgetsAFailedTransferOnceItsTTLHasPassed(t *testing.T) {
 }
 
 func TestSweep_DropsAStalledTransferAndItsPartFile(t *testing.T) {
-	// a sender that opens a transfer and then goes quiet must not hold an
-	// entry, an open file and a .gshift-part forever.
 	s := newServer(t)
 	s.TransferTTL = 100 * time.Millisecond
 
 	half := chunkWire(t, "stalled.bin", 10, 0, 4, []byte("ABCD"))
 	if err := deliver(t, s, half); err != nil {
-		t.Fatalf("receive() error = %v, want nil", err)
+		t.Fatalf("receiveChunk() error = %v, want nil", err)
 	}
 	if got := entries(t, s.OutDir); len(got) != 1 {
 		t.Fatalf("output dir holds %v, want the part file while the transfer is under way", got)
@@ -683,7 +600,7 @@ func TestSweep_DropsAStalledTransferAndItsPartFile(t *testing.T) {
 	time.Sleep(3 * s.TransferTTL)
 	s.sweep(time.Now())
 
-	if _, ok := s.chunks.Load("stalled.bin"); ok {
+	if _, ok := s.assemblies.Load("stalled.bin"); ok {
 		t.Error("the stalled transfer is still tracked, want it swept")
 	}
 	if got := entries(t, s.OutDir); len(got) != 0 {
@@ -691,8 +608,6 @@ func TestSweep_DropsAStalledTransferAndItsPartFile(t *testing.T) {
 	}
 }
 
-// wantRejected checks that at least one of the chunks was turned away, and that
-// every error blames the same thing.
 func wantRejected(t *testing.T, errs []error, reason string) {
 	t.Helper()
 
@@ -703,7 +618,7 @@ func wantRejected(t *testing.T, errs []error, reason string) {
 		}
 		rejected = true
 		if !strings.Contains(err.Error(), reason) {
-			t.Errorf("receive() error = %q, want it to mention %q", err, reason)
+			t.Errorf("receiveChunk() error = %q, want it to mention %q", err, reason)
 		}
 	}
 	if !rejected {
@@ -711,12 +626,6 @@ func wantRejected(t *testing.T, errs []error, reason string) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 3. Serve
-// ---------------------------------------------------------------------------
-
-// startServer runs Serve on a local listener and returns its address. closing
-// the listener at the end of the test is what makes Serve return.
 func startServer(t *testing.T, s *Server) string {
 	t.Helper()
 
@@ -740,8 +649,6 @@ func startServer(t *testing.T, s *Server) string {
 	return ln.Addr().String()
 }
 
-// send does one client side transfer to addr.
-// t.Errorf not t.Fatalf, the concurrent test calls this from goroutines.
 func send(t *testing.T, addr, name string, payload []byte) {
 	t.Helper()
 
@@ -764,8 +671,6 @@ func send(t *testing.T, addr, name string, payload []byte) {
 	}
 }
 
-// waitForFile waits for dir/name to show up. Serve handles each connection in
-// its own goroutine, so the file lands a moment after the client is done.
 func waitForFile(t *testing.T, dir, name string) {
 	t.Helper()
 
@@ -790,7 +695,6 @@ func TestServe_ReceivesAFileOverTheNetwork(t *testing.T) {
 }
 
 func TestServe_HandlesSeveralConnectionsInSequence(t *testing.T) {
-	// the accept loop must keep going after a transfer finishes.
 	s := newServer(t)
 	addr := startServer(t, s)
 
@@ -802,8 +706,6 @@ func TestServe_HandlesSeveralConnectionsInSequence(t *testing.T) {
 }
 
 func TestServe_HandlesConcurrentConnections(t *testing.T) {
-	// one goroutine per connection, so they must not mix up each other's files.
-	// run this under -race.
 	s := newServer(t)
 	addr := startServer(t, s)
 
@@ -823,8 +725,6 @@ func TestServe_HandlesConcurrentConnections(t *testing.T) {
 }
 
 func TestServe_SurvivesAConnectionThatSendsGarbage(t *testing.T) {
-	// a bad peer only loses its own transfer. the loop stays up and the next
-	// client still works.
 	s := newServer(t)
 	addr := startServer(t, s)
 
@@ -848,14 +748,12 @@ func TestServe_SurvivesAConnectionThatHangsUpMidTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial() error = %v, want nil", err)
 	}
-	// promise 100 bytes, send 4, then vanish.
 	_, _ = conn.Write(wire(t, "half.txt", 100, []byte("abcd")))
 	conn.Close()
 
 	send(t, addr, "after.txt", []byte("still up"))
 	waitForFile(t, s.OutDir, "after.txt")
 
-	// the dead transfer leaves nothing behind, not even a .part file.
 	wantOnly(t, s.OutDir, "after.txt")
 }
 
@@ -868,8 +766,6 @@ func TestServe_CreatesTheOutputDir(t *testing.T) {
 }
 
 func TestServe_FailsWhenTheOutputDirCannotBeCreated(t *testing.T) {
-	// a file sits where a dir should be. MkdirAll cannot fix that, so Serve fails
-	// before it accepts anything.
 	blocker := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
 		t.Fatalf("seeding the blocking file: %v", err)
@@ -901,7 +797,6 @@ func TestServe_ReturnsWhenTheListenerCloses(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ln) }()
 
-	// let Serve reach Accept, then take the listener away.
 	time.Sleep(50 * time.Millisecond)
 	ln.Close()
 
@@ -919,8 +814,6 @@ func TestServe_ReturnsWhenTheListenerCloses(t *testing.T) {
 }
 
 func TestServe_ClosesTheListenerOnTheWayOut(t *testing.T) {
-	// Serve owns the listener it is given, so the same port must be free again
-	// once it returns.
 	blocker := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
 		t.Fatalf("seeding the blocking file: %v", err)
@@ -932,7 +825,6 @@ func TestServe_ClosesTheListenerOnTheWayOut(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 
-	// this fails right away on the out dir, but it still has to close ln.
 	s := &Server{OutDir: filepath.Join(blocker, "incoming")}
 	if err := s.Serve(ln); err == nil {
 		t.Fatal("Serve() error = nil, want a failure preparing the output dir")
@@ -944,10 +836,6 @@ func TestServe_ClosesTheListenerOnTheWayOut(t *testing.T) {
 	}
 	reopened.Close()
 }
-
-// ---------------------------------------------------------------------------
-// 4. ListenAndServe
-// ---------------------------------------------------------------------------
 
 func TestListenAndServe_ReportsAnUnusableAddress(t *testing.T) {
 	tests := []struct {
@@ -978,9 +866,6 @@ func TestListenAndServe_ReportsAnUnusableAddress(t *testing.T) {
 }
 
 func TestListenAndServe_BindsThenHandsOffToServe(t *testing.T) {
-	// port 0 lets the kernel pick a free port, so this binds for real. a bad
-	// OutDir then makes Serve return at once, which shows we got past listen and
-	// passed Serve's error back.
 	blocker := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
 		t.Fatalf("seeding the blocking file: %v", err)
@@ -998,7 +883,6 @@ func TestListenAndServe_BindsThenHandsOffToServe(t *testing.T) {
 }
 
 func TestListenAndServe_DoesNotCreateTheOutputDirWhenListenFails(t *testing.T) {
-	// listen runs first, so a bad address should not leave a dir behind.
 	dir := filepath.Join(t.TempDir(), "incoming")
 	s := &Server{Addr: "127.0.0.1:99999", OutDir: dir}
 

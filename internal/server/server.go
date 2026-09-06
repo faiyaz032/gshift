@@ -1,4 +1,3 @@
-// Package server receives gshift transfers and writes them to disk.
 package server
 
 import (
@@ -20,53 +19,37 @@ import (
 
 const defaultHeaderTimeout = 30 * time.Second
 
-// how long a failed or stalled transfer is remembered, both to keep its name
-// rejected and to keep the entry around at all.
 const defaultTransferTTL = 5 * time.Minute
 
 type Server struct {
-	Addr string
-
-	OutDir string
-
+	Addr          string
+	OutDir        string
 	HeaderTimeout time.Duration
-
-	// TransferTTL is how long a failed or stalled transfer is remembered before
-	// it is swept and its name is free again. zero means defaultTransferTTL.
-	TransferTTL time.Duration
-
-	chunks sync.Map
-
-	// unix nanos of the earliest next sweep
-	sweepAt atomic.Int64
+	TransferTTL   time.Duration
+	assemblies    sync.Map
+	nextSweepAt   atomic.Int64
 }
 
-// span is a half open byte range [start, end) of the file that has arrived.
 type span struct {
 	start, end int64
 }
 
-type inflight struct {
-	mu       sync.Mutex
-	file     *os.File
-	tmp, dst string
-	total    int64
+type fileAssembly struct {
+	mu               sync.Mutex
+	file             *os.File
+	tmpPath, dstPath string
+	totalSize        int64
 
-	// sorted, disjoint, and never touching, so covering the whole file leaves
-	// exactly one span
 	spans []span
 
-	// chunks still writing. an entry is only swept once this is zero.
-	active  int
-	updated time.Time
-	closed  bool
+	activeChunks int
+	updated      time.Time
+	closed       bool
 }
 
-// open returns the entry for name, creating and preallocating the part file on
-// the first chunk. the caller must release the entry once its chunk is done.
-func (s *Server) open(name, dst, tmp string, total int64) (*inflight, error) {
-	actual, _ := s.chunks.LoadOrStore(name, &inflight{})
-	entry := actual.(*inflight)
+func (s *Server) acquireEntry(name, dst, tmp string, total int64) (*fileAssembly, error) {
+	actual, _ := s.assemblies.LoadOrStore(name, &fileAssembly{})
+	entry := actual.(*fileAssembly)
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
@@ -87,38 +70,31 @@ func (s *Server) open(name, dst, tmp string, total int64) (*inflight, error) {
 			return nil, fmt.Errorf("server: preallocate %s: %w", tmp, err)
 		}
 		entry.file = f
-		entry.tmp = tmp
-		entry.dst = dst
-		entry.total = total
+		entry.tmpPath = tmp
+		entry.dstPath = dst
+		entry.totalSize = total
 
-	case entry.total != total:
-		// the senders disagree about the file, so neither of them can be
-		// trusted with it.
+	case entry.totalSize != total:
 		entry.abortLocked()
 		return nil, fmt.Errorf("server: %s: chunk declares a total of %d bytes, the transfer under way declares %d",
-			name, total, entry.total)
+			name, total, entry.totalSize)
 	}
 
-	entry.active++
+	entry.activeChunks++
 	entry.updated = time.Now()
 
 	return entry, nil
 }
 
-// release marks this connection's chunk finished, however it went.
-func (e *inflight) release() {
+func (e *fileAssembly) markChunkFinished() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	e.active--
+	e.activeChunks--
 	e.updated = time.Now()
 }
 
-// addSpan records that [offset, offset+n) has been written. it reports an error
-// if that range overlaps one already recorded, and done once the recorded spans
-// cover the whole file. counting bytes alone would not do: two overlapping
-// chunks can add up to the total while leaving a hole.
-func (e *inflight) addSpan(offset, n int64) (done bool, err error) {
+func (e *fileAssembly) recordSpan(offset, n int64) (done bool, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -126,13 +102,12 @@ func (e *inflight) addSpan(offset, n int64) (done bool, err error) {
 
 	i := sort.Search(len(e.spans), func(i int) bool { return e.spans[i].start >= s.start })
 	if i > 0 && e.spans[i-1].end > s.start {
-		return false, overlap(s, e.spans[i-1])
+		return false, overlapError(s, e.spans[i-1])
 	}
 	if i < len(e.spans) && e.spans[i].start < s.end {
-		return false, overlap(s, e.spans[i])
+		return false, overlapError(s, e.spans[i])
 	}
 
-	// insert in order, then close up the seam with either neighbour
 	e.spans = slices.Insert(e.spans, i, s)
 	if i+1 < len(e.spans) && e.spans[i].end == e.spans[i+1].start {
 		e.spans[i].end = e.spans[i+1].end
@@ -144,21 +119,19 @@ func (e *inflight) addSpan(offset, n int64) (done bool, err error) {
 	}
 
 	covered := e.spans[0]
-	return len(e.spans) == 1 && covered.start == 0 && covered.end == e.total, nil
+	return len(e.spans) == 1 && covered.start == 0 && covered.end == e.totalSize, nil
 }
 
-func overlap(got, have span) error {
+func overlapError(got, have span) error {
 	return fmt.Errorf("chunk [%d,%d) overlaps [%d,%d), which already arrived",
 		got.start, got.end, have.start, have.end)
 }
 
-// stale reports whether the entry has been idle since cutoff with no chunk
-// still writing, and gives up on it if so.
-func (e *inflight) stale(cutoff time.Time) bool {
+func (e *fileAssembly) expireIfStale(cutoff time.Time) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.active > 0 || e.updated.After(cutoff) {
+	if e.activeChunks > 0 || e.updated.After(cutoff) {
 		return false
 	}
 	e.abortLocked()
@@ -166,32 +139,32 @@ func (e *inflight) stale(cutoff time.Time) bool {
 	return true
 }
 
-func (e *inflight) abort() {
+func (e *fileAssembly) abort() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	e.abortLocked()
 }
 
-func (e *inflight) abortLocked() {
+func (e *fileAssembly) abortLocked() {
 	if e.closed {
 		return
 	}
 	e.closed = true
 	if e.file != nil {
 		e.file.Close()
-		os.Remove(e.tmp)
+		os.Remove(e.tmpPath)
 	}
 }
 
-func (e *inflight) commit() error {
+func (e *fileAssembly) commit() error {
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
-		return fmt.Errorf("server: %s: transfer already finished", e.dst)
+		return fmt.Errorf("server: %s: transfer already finished", e.dstPath)
 	}
 	e.closed = true
-	f, tmp, dst := e.file, e.tmp, e.dst
+	f, tmp, dst := e.file, e.tmpPath, e.dstPath
 	e.mu.Unlock()
 
 	if err := f.Close(); err != nil {
@@ -205,41 +178,37 @@ func (e *inflight) commit() error {
 	return nil
 }
 
-// sweep drops entries for transfers that failed or stalled more than a ttl ago,
-// so one bad chunk cannot poison a name forever and the map cannot grow without
-// bound. it does the walk at most once per ttl.
 func (s *Server) sweep(now time.Time) {
-	ttl := s.transferTTL()
+	ttl := s.effectiveTransferTTL()
 
-	next := s.sweepAt.Load()
-	if now.UnixNano() < next || !s.sweepAt.CompareAndSwap(next, now.Add(ttl).UnixNano()) {
+	next := s.nextSweepAt.Load()
+	if now.UnixNano() < next || !s.nextSweepAt.CompareAndSwap(next, now.Add(ttl).UnixNano()) {
 		return
 	}
 
 	cutoff := now.Add(-ttl)
-	s.chunks.Range(func(key, value any) bool {
-		if entry := value.(*inflight); entry.stale(cutoff) {
-			s.chunks.Delete(key)
+	s.assemblies.Range(func(key, value any) bool {
+		if entry := value.(*fileAssembly); entry.expireIfStale(cutoff) {
+			s.assemblies.Delete(key)
 		}
 		return true
 	})
 }
 
-func (s *Server) headerTimeout() time.Duration {
+func (s *Server) effectiveHeaderTimeout() time.Duration {
 	if s.HeaderTimeout > 0 {
 		return s.HeaderTimeout
 	}
 	return defaultHeaderTimeout
 }
 
-func (s *Server) transferTTL() time.Duration {
+func (s *Server) effectiveTransferTTL() time.Duration {
 	if s.TransferTTL > 0 {
 		return s.TransferTTL
 	}
 	return defaultTransferTTL
 }
 
-// ListenAndServe binds Addr and serves until the listener fails.
 func (s *Server) ListenAndServe() error {
 	ln, err := net.Listen("tcp", s.Addr)
 	if err != nil {
@@ -248,8 +217,6 @@ func (s *Server) ListenAndServe() error {
 	return s.Serve(ln)
 }
 
-// Serve makes OutDir, then takes connections on ln until it fails. each one is
-// handled in its own goroutine. Serve closes ln before it returns.
 func (s *Server) Serve(ln net.Listener) error {
 	defer ln.Close()
 
@@ -265,21 +232,21 @@ func (s *Server) Serve(ln net.Listener) error {
 			return fmt.Errorf("server: accept: %w", err)
 		}
 
-		go s.handle(conn)
+		go s.handleConn(conn)
 	}
 }
 
-func (s *Server) handle(conn net.Conn) {
+func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
-	if err := s.receive(conn); err != nil {
+	if err := s.receiveChunk(conn); err != nil {
 		log.Printf("transfer from %s failed: %v", conn.RemoteAddr(), err)
 	}
 }
 
-func (s *Server) receive(conn net.Conn) error {
+func (s *Server) receiveChunk(conn net.Conn) error {
 	s.sweep(time.Now())
 
-	if err := conn.SetReadDeadline(time.Now().Add(s.headerTimeout())); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(s.effectiveHeaderTimeout())); err != nil {
 		return fmt.Errorf("server: set header deadline: %w", err)
 	}
 
@@ -298,11 +265,11 @@ func (s *Server) receive(conn net.Conn) error {
 	dst := filepath.Join(s.OutDir, name)
 	tmp := dst + ".gshift-part"
 
-	entry, err := s.open(name, dst, tmp, hdr.TotalSize)
+	entry, err := s.acquireEntry(name, dst, tmp, hdr.TotalSize)
 	if err != nil {
 		return err
 	}
-	defer entry.release()
+	defer entry.markChunkFinished()
 
 	n, err := io.CopyN(io.NewOffsetWriter(entry.file, hdr.Offset), conn, hdr.Length)
 	if err != nil {
@@ -313,7 +280,7 @@ func (s *Server) receive(conn net.Conn) error {
 		return fmt.Errorf("server: %s: copied %d of %d bytes: %w", name, n, hdr.Length, err)
 	}
 
-	done, err := entry.addSpan(hdr.Offset, n)
+	done, err := entry.recordSpan(hdr.Offset, n)
 	if err != nil {
 		entry.abort()
 		return fmt.Errorf("server: %s: %w", name, err)
@@ -325,8 +292,8 @@ func (s *Server) receive(conn net.Conn) error {
 	if err := entry.commit(); err != nil {
 		return err
 	}
-	s.chunks.Delete(name)
+	s.assemblies.Delete(name)
 
-	log.Printf("received %s (%d bytes) from %s", name, entry.total, conn.RemoteAddr())
+	log.Printf("received %s (%d bytes) from %s", name, entry.totalSize, conn.RemoteAddr())
 	return nil
 }
